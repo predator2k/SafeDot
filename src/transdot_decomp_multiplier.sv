@@ -452,7 +452,13 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
   // SafeDot stage-0 probe: 1 instantiates the mod-3 residue shadow. The
   // shadow body is additionally guarded by `SAFEDOT_CHECK_EN so that flows
   // which do not compile the safedot_mod3 sources are unaffected.
+  // Defining SAFEDOT_FMA_CHECK flips the default so enclosing designs (the
+  // FMA via w6_direct_outputs) enable the shadow without interface changes.
+`ifdef SAFEDOT_FMA_CHECK
+  parameter bit          SAFEDOT_CHECK  = 1'b1
+`else
   parameter bit          SAFEDOT_CHECK  = 1'b0
+`endif
 )(
   // 1'b0 -> scalar mode: 24x24 product
   // 1'b1 -> SIMD/DP mode: packed {a_hi*b_hi, a_lo*b_lo} where hi/lo are 12-bit halves
