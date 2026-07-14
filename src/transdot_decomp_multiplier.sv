@@ -448,7 +448,11 @@ endmodule
 
 
 module transdot_decomp_multiplier_w6_4lane_dp_piped #(
-  parameter int unsigned PRECISION_BITS = 24  // fixed at 24
+  parameter int unsigned PRECISION_BITS = 24,  // fixed at 24
+  // SafeDot stage-0 probe: 1 instantiates the mod-3 residue shadow. The
+  // shadow body is additionally guarded by `SAFEDOT_CHECK_EN so that flows
+  // which do not compile the safedot_mod3 sources are unaffected.
+  parameter bit          SAFEDOT_CHECK  = 1'b0
 )(
   // 1'b0 -> scalar mode: 24x24 product
   // 1'b1 -> SIMD/DP mode: packed {a_hi*b_hi, a_lo*b_lo} where hi/lo are 12-bit halves
@@ -484,7 +488,11 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
   // Signed 2's-complement compressor sum, exposed for INT-mode FMA reuse.
   // The FP path takes the magnitude form on product_dp_o; the INT path reads
   // this signed sum directly and skips the magnitude extraction.
-  output logic [49:0]                      product_int_dp_o
+  output logic [49:0]                      product_int_dp_o,
+  // SafeDot mod-3 residue shadow alarms, valid one cycle after the outputs:
+  // {sign_out, product_int_dp, product_dp, product_non_dp} mismatches.
+  // Constant 0 when the shadow is disabled.
+  output logic [3:0]                       safedot_alarm_o
 );
 
   // --------------------------------------------------------------------------
@@ -681,6 +689,438 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
   assign product_dp_o = product_dp_q;
   assign sign_out = sign_out_q;
   assign product_int_dp_o = product_int_dp_q;
+`endif
+
+  // --------------------------------------------------------------------------
+  // SafeDot mod-3 residue shadow (stage-0 probe, v2 staging; docs/SafeDot.md
+  // sec. 5.1/5.2/8.1).
+  //
+  // Launch cycle: ONLY raw taps of main-path nets are captured into shadow
+  // registers, plus the operand segment residue trees (which hang off the
+  // module inputs and finish far earlier than the multiplier cone). No shadow
+  // arithmetic is stacked on main-path logic in the launch cycle, so the
+  // shadow cannot set the block's Fmax wall (v1 computed the lane/wrap chain
+  // in the launch cycle and was measured to move the wall by ~100 ps).
+  // Compare cycle: the full residue chain (partial-product residues, lane
+  // shift/negate identities 4/5, 50-bit wrap correction, output predictions),
+  // the residue extraction from the registered outputs, and the compare.
+  //
+  // Taps registered in the launch cycle:
+  //   - pp[i][i][7:0] fp8/int4 lane payloads and pp3_res[0]/[3] fp16 payloads
+  //     (identity-5 discarded-segment extraction happens post-register),
+  //   - shamts / lane signs / mode decodes consumed by the shadow math,
+  //   - the four addend sign bits (50-bit wrap count K),
+  //   - final_sum[49:48], final_sum_mag[49]/[48]/[0], independent |final_sum.
+  //
+  // Relied-on input invariants (guaranteed by the FMA operand packer):
+  //  - fp8/int4 DP (dp_enable_i && is_fp8 && !is_fp4): lane payloads keep
+  //    pp[i][i][11:8] == 0, so r(pp[i][i][7:0]) == r(pp[i][i]);
+  //  - fp16/int8 DP (dp_enable_i && !is_fp8 && !is_fp4): mantissa halves
+  //    carry a leading zero ({1'b0, 11-bit payload}), so pp3_res[0]/[3]
+  //    < 2^22 and a lane's two's-complement sign equals
+  //    sign_lane & (shifted != 0) (used for the in-shadow wrap count K).
+  // --------------------------------------------------------------------------
+`ifdef SAFEDOT_CHECK_EN
+`ifndef SAFEDOT_CMP_STAGES
+`define SAFEDOT_CMP_STAGES 1
+`endif
+  generate if (SAFEDOT_CHECK) begin : g_safedot
+    import safedot_mod3_pkg::*;
+    // 1: single compare cycle (alarm 1 cycle after the outputs);
+    // 2: the compare chain is itself pipelined (alarm 2 cycles after the
+    //    outputs) so each shadow stage fits high-frequency cycles.
+    localparam int unsigned CmpStages = `SAFEDOT_CMP_STAGES;
+
+    // ---- launch cycle: operand-side residues (module inputs only)
+    res3_t sd_ra_seg [0:NSEG-1];
+    res3_t sd_rb_seg [0:NSEG-1];
+    for (genvar gi = 0; gi < NSEG; gi++) begin : g_sd_opext
+      safedot_mod3_reduce #(.W(SEG_W)) u_sd_ra (.x_i(a_seg[gi]), .r_o(sd_ra_seg[gi]));
+      safedot_mod3_reduce #(.W(SEG_W)) u_sd_rb (.x_i(b_seg[gi]), .r_o(sd_rb_seg[gi]));
+    end
+
+    res3_t sd_r_fp4mag [0:3];
+    safedot_mod3_reduce #(.W(9)) u_sd_f4m0 (.x_i(fp4_y_mag0), .r_o(sd_r_fp4mag[0]));
+    safedot_mod3_reduce #(.W(9)) u_sd_f4m1 (.x_i(fp4_y_mag1), .r_o(sd_r_fp4mag[1]));
+    safedot_mod3_reduce #(.W(9)) u_sd_f4m2 (.x_i(fp4_y_mag2), .r_o(sd_r_fp4mag[2]));
+    safedot_mod3_reduce #(.W(9)) u_sd_f4m3 (.x_i(fp4_y_mag3), .r_o(sd_r_fp4mag[3]));
+    logic [3:0] sd_f4z_d;
+    assign sd_f4z_d = {~(|fp4_y_mag3), ~(|fp4_y_mag2), ~(|fp4_y_mag1), ~(|fp4_y_mag0)};
+
+    // ---- launch cycle: raw main-path taps.
+    // v3: no compressor-sum or addend-sign taps at all — final_sum bits are
+    // read from the registered product_int_dp output in the compare cycle,
+    // and the wrap count K is derived in-shadow from lane signs and the
+    // shift/negate zero flags. The only main-datapath taps left are the
+    // early lane payloads below, so neither the 50-bit CPA, the magnitude
+    // negate, nor the lane addend muxes are pinned to a pipeline stage.
+
+    res3_t sd_ra_seg_q [0:NSEG-1];
+    res3_t sd_rb_seg_q [0:NSEG-1];
+    res3_t sd_r_fp4mag_q [0:3];
+    logic [3:0]  sd_f4z_q;
+    logic [7:0]  sd_pp00_q, sd_pp11_q, sd_pp22_q, sd_pp33_q;
+    logic [23:0] sd_pp3r0_q, sd_pp3r3_q;
+    logic [5:0]  sd_sh0_q, sd_sh1_q;
+    logic [4:0]  sd_sh2_q, sd_sh3_q;
+    logic [3:0]  sd_sgn_q;
+    logic        sd_isfp8_q, sd_isfp4_q, sd_dpen_q, sd_gpp3_q;
+
+
+`ifdef COMBINATIONAL
+    assign sd_ra_seg_q   = sd_ra_seg;
+    assign sd_rb_seg_q   = sd_rb_seg;
+    assign sd_r_fp4mag_q = sd_r_fp4mag;
+    assign sd_f4z_q   = sd_f4z_d;
+    assign sd_pp00_q  = pp[0][0][7:0];
+    assign sd_pp11_q  = pp[1][1][7:0];
+    assign sd_pp22_q  = pp[2][2][7:0];
+    assign sd_pp33_q  = pp[3][3][7:0];
+    assign sd_pp3r0_q = pp3_res[0];
+    assign sd_pp3r3_q = pp3_res[3];
+    assign sd_sh0_q   = shamt_lane0;
+    assign sd_sh1_q   = shamt_lane1;
+    assign sd_sh2_q   = shamt_lane2;
+    assign sd_sh3_q   = shamt_lane3;
+    assign sd_sgn_q   = {sign_lane3, sign_lane2, sign_lane1, sign_lane0};
+    assign sd_isfp8_q = is_fp8;
+    assign sd_isfp4_q = is_fp4;
+    assign sd_dpen_q  = dp_enable_i;
+    assign sd_gpp3_q  = gated_pp3;
+`else
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+      if (!rst_ni) begin
+        for (int i = 0; i < NSEG; i++) begin
+          sd_ra_seg_q[i] <= 2'd0;
+          sd_rb_seg_q[i] <= 2'd0;
+        end
+        for (int i = 0; i < 4; i++) sd_r_fp4mag_q[i] <= 2'd0;
+        sd_f4z_q     <= '0;
+        sd_pp00_q    <= '0;
+        sd_pp11_q    <= '0;
+        sd_pp22_q    <= '0;
+        sd_pp33_q    <= '0;
+        sd_pp3r0_q   <= '0;
+        sd_pp3r3_q   <= '0;
+        sd_sh0_q     <= '0;
+        sd_sh1_q     <= '0;
+        sd_sh2_q     <= '0;
+        sd_sh3_q     <= '0;
+        sd_sgn_q     <= '0;
+        sd_isfp8_q   <= 1'b0;
+        sd_isfp4_q   <= 1'b0;
+        sd_dpen_q    <= 1'b0;
+        sd_gpp3_q    <= 1'b0;
+      end else if (pipe_en) begin
+        for (int i = 0; i < NSEG; i++) begin
+          sd_ra_seg_q[i] <= sd_ra_seg[i];
+          sd_rb_seg_q[i] <= sd_rb_seg[i];
+        end
+        for (int i = 0; i < 4; i++) sd_r_fp4mag_q[i] <= sd_r_fp4mag[i];
+        sd_f4z_q   <= sd_f4z_d;
+        sd_pp00_q  <= pp[0][0][7:0];
+        sd_pp11_q  <= pp[1][1][7:0];
+        sd_pp22_q  <= pp[2][2][7:0];
+        sd_pp33_q  <= pp[3][3][7:0];
+        sd_pp3r0_q <= pp3_res[0];
+        sd_pp3r3_q <= pp3_res[3];
+        sd_sh0_q   <= shamt_lane0;
+        sd_sh1_q   <= shamt_lane1;
+        sd_sh2_q   <= shamt_lane2;
+        sd_sh3_q   <= shamt_lane3;
+        sd_sgn_q   <= {sign_lane3, sign_lane2, sign_lane1, sign_lane0};
+        sd_isfp8_q <= is_fp8;
+        sd_isfp4_q <= is_fp4;
+        sd_dpen_q  <= dp_enable_i;
+        sd_gpp3_q  <= gated_pp3;
+      end
+    end
+`endif
+
+    // ---- compare cycle: partial-product residues, gating mirrored
+    // (gated_pp == is_fp8 in this module).
+    res3_t sd_r_pp00, sd_r_pp01, sd_r_pp10, sd_r_pp11;
+    res3_t sd_r_pp22, sd_r_pp23, sd_r_pp32, sd_r_pp33;
+    assign sd_r_pp00 = sd_mul3(sd_ra_seg_q[0], sd_rb_seg_q[0]);
+    assign sd_r_pp01 = sd_isfp8_q ? 2'd0 : sd_mul3(sd_ra_seg_q[0], sd_rb_seg_q[1]);
+    assign sd_r_pp10 = sd_isfp8_q ? 2'd0 : sd_mul3(sd_ra_seg_q[1], sd_rb_seg_q[0]);
+    assign sd_r_pp11 = sd_mul3(sd_ra_seg_q[1], sd_rb_seg_q[1]);
+    assign sd_r_pp22 = sd_mul3(sd_ra_seg_q[2], sd_rb_seg_q[2]);
+    assign sd_r_pp23 = sd_isfp8_q ? 2'd0 : sd_mul3(sd_ra_seg_q[2], sd_rb_seg_q[3]);
+    assign sd_r_pp32 = sd_isfp8_q ? 2'd0 : sd_mul3(sd_ra_seg_q[3], sd_rb_seg_q[2]);
+    assign sd_r_pp33 = sd_mul3(sd_ra_seg_q[3], sd_rb_seg_q[3]);
+
+    // pp3_res residues. pp3_res[0] == pp00 + (pp01 + pp10)*2^6 + pp11*2^12
+    // exactly (the 18-bit inner sum peaks at 262017 < 2^18), and
+    // 2^6 == 2^12 == 1 (mod 3). Halves reuse segment residue sums.
+    res3_t sd_ra_lo, sd_ra_hi, sd_rb_lo, sd_rb_hi;
+    assign sd_ra_lo = sd_add3(sd_ra_seg_q[0], sd_ra_seg_q[1]);
+    assign sd_ra_hi = sd_add3(sd_ra_seg_q[2], sd_ra_seg_q[3]);
+    assign sd_rb_lo = sd_add3(sd_rb_seg_q[0], sd_rb_seg_q[1]);
+    assign sd_rb_hi = sd_add3(sd_rb_seg_q[2], sd_rb_seg_q[3]);
+    res3_t sd_r_pp3 [0:3];
+    assign sd_r_pp3[0] = sd_add3(sd_add3(sd_r_pp00, sd_r_pp01), sd_add3(sd_r_pp10, sd_r_pp11));
+    assign sd_r_pp3[1] = sd_gpp3_q ? 2'd0 : sd_mul3(sd_ra_lo, sd_rb_hi);
+    assign sd_r_pp3[2] = sd_gpp3_q ? 2'd0 : sd_mul3(sd_ra_hi, sd_rb_lo);
+    assign sd_r_pp3[3] = sd_add3(sd_add3(sd_r_pp22, sd_r_pp23), sd_add3(sd_r_pp32, sd_r_pp33));
+
+    // FP8/INT4 DP lanes: 24-bit field truncating shift + conditional negate,
+    // on the registered live payloads (identities 4/5).
+    res3_t sd_r_xored00, sd_r_xored11, sd_r_xored22, sd_r_xored33;
+    safedot_mod3_shiftneg #(.FW(24), .LW(8), .LO(14), .SW(5)) u_sd_lane0 (
+      .x_live_i(sd_pp00_q), .rx_i(sd_r_pp00),
+      .shamt_i(sd_sh0_q[4:0]), .neg_i(sd_sgn_q[0]), .r_o(sd_r_xored00), .q_zero_o(sd_zq8_0));
+    safedot_mod3_shiftneg #(.FW(24), .LW(8), .LO(14), .SW(5)) u_sd_lane1 (
+      .x_live_i(sd_pp11_q), .rx_i(sd_r_pp11),
+      .shamt_i(sd_sh1_q[4:0]), .neg_i(sd_sgn_q[1]), .r_o(sd_r_xored11), .q_zero_o(sd_zq8_1));
+    safedot_mod3_shiftneg #(.FW(24), .LW(8), .LO(14), .SW(5)) u_sd_lane2 (
+      .x_live_i(sd_pp22_q), .rx_i(sd_r_pp22),
+      .shamt_i(sd_sh2_q), .neg_i(sd_sgn_q[2]), .r_o(sd_r_xored22), .q_zero_o(sd_zq8_2));
+    safedot_mod3_shiftneg #(.FW(24), .LW(8), .LO(14), .SW(5)) u_sd_lane3 (
+      .x_live_i(sd_pp33_q), .rx_i(sd_r_pp33),
+      .shamt_i(sd_sh3_q), .neg_i(sd_sgn_q[3]), .r_o(sd_r_xored33), .q_zero_o(sd_zq8_3));
+
+    // FP16/INT8 DP lanes: 36-bit field, 24-bit payload 12 bits up.
+    res3_t sd_r_x16_0, sd_r_x16_1;
+    safedot_mod3_shiftneg #(.FW(36), .LW(24), .LO(12), .SW(6)) u_sd_lane16_0 (
+      .x_live_i(sd_pp3r0_q), .rx_i(sd_r_pp3[0]),
+      .shamt_i(sd_sh0_q), .neg_i(sd_sgn_q[0]), .r_o(sd_r_x16_0), .q_zero_o(sd_zq16_0));
+    safedot_mod3_shiftneg #(.FW(36), .LW(24), .LO(12), .SW(6)) u_sd_lane16_1 (
+      .x_live_i(sd_pp3r3_q), .rx_i(sd_r_pp3[3]),
+      .shamt_i(sd_sh1_q), .neg_i(sd_sgn_q[1]), .r_o(sd_r_x16_1), .q_zero_o(sd_zq16_1));
+
+    // FP4 DP lanes: negate only; aligned term is mag * 2^13 (13 odd -> x2).
+    res3_t sd_r_al0, sd_r_al1, sd_r_al2, sd_r_al3;
+    assign sd_r_al0 = sd_mulpow2(sd_r_fp4mag_q[0], 1'b1);
+    assign sd_r_al1 = sd_mulpow2(sd_r_fp4mag_q[1], 1'b1);
+    assign sd_r_al2 = sd_mulpow2(sd_r_fp4mag_q[2], 1'b1);
+    assign sd_r_al3 = sd_mulpow2(sd_r_fp4mag_q[3], 1'b1);
+    res3_t sd_r_xf4_00, sd_r_xf4_11, sd_r_xf4_22, sd_r_xf4_33;
+    assign sd_r_xf4_00 = sd_sgn_q[0] ? (sd_f4z_q[0] ? 2'd0 : sd_sub3(2'd1, sd_r_al0)) : sd_r_al0;
+    assign sd_r_xf4_11 = sd_sgn_q[1] ? (sd_f4z_q[1] ? 2'd0 : sd_sub3(2'd1, sd_r_al1)) : sd_r_al1;
+    assign sd_r_xf4_22 = sd_sgn_q[2] ? (sd_f4z_q[2] ? 2'd0 : sd_sub3(2'd1, sd_r_al2)) : sd_r_al2;
+    assign sd_r_xf4_33 = sd_sgn_q[3] ? (sd_f4z_q[3] ? 2'd0 : sd_sub3(2'd1, sd_r_al3)) : sd_r_al3;
+
+    // ---- B1 captures of the checked outputs (operation-N aligned):
+    // fs bits from the registered int output, extraction residues, sign_out.
+    logic sd_fs49_b1, sd_fs48_b1, sd_fs0_b1, sd_fs_lo_z_b1, sd_sign_b1;
+    res3_t sd_x_nondp_b1, sd_x_dp_b1, sd_x_int_b1;
+    assign sd_fs49_b1    = product_int_dp_o[49];
+    assign sd_fs48_b1    = product_int_dp_o[48];
+    assign sd_fs0_b1     = product_int_dp_o[0];
+    assign sd_fs_lo_z_b1 = ~(|product_int_dp_o[48:0]);
+    assign sd_sign_b1    = sign_out;
+    safedot_mod3_reduce #(.W(48)) u_sd_x_nondp (.x_i(product_non_dp_o), .r_o(sd_x_nondp_b1));
+    safedot_mod3_reduce #(.W(48)) u_sd_x_dp    (.x_i(product_dp_o),     .r_o(sd_x_dp_b1));
+    safedot_mod3_reduce #(.W(50)) u_sd_x_int   (.x_i(product_int_dp_o), .r_o(sd_x_int_b1));
+
+    // ---- B1/B2 boundary: wires for CmpStages == 1, a register stage for
+    // CmpStages == 2 (so each shadow stage fits a high-frequency cycle).
+    res3_t sd_r_xored00_c, sd_r_xored11_c, sd_r_xored22_c, sd_r_xored33_c;
+    res3_t sd_r_x16_0_c, sd_r_x16_1_c;
+    res3_t sd_r_xf4_00_c, sd_r_xf4_11_c, sd_r_xf4_22_c, sd_r_xf4_33_c;
+    res3_t sd_r_pp3_c [0:3];
+    logic  sd_zq8_0_c, sd_zq8_1_c, sd_zq8_2_c, sd_zq8_3_c;
+    logic  sd_zq16_0_c, sd_zq16_1_c;
+    logic [3:0] sd_f4z_c, sd_sgn_c;
+    logic  sd_isfp8_c, sd_isfp4_c, sd_dpen_c;
+    logic  sd_fs49_c, sd_fs48_c, sd_fs0_c, sd_fs_lo_z_c, sd_sign_c;
+    res3_t sd_x_nondp_c, sd_x_dp_c, sd_x_int_c;
+    if (CmpStages == 1) begin : g_sd_cmp1
+      assign sd_r_xored00_c = sd_r_xored00;
+      assign sd_r_xored11_c = sd_r_xored11;
+      assign sd_r_xored22_c = sd_r_xored22;
+      assign sd_r_xored33_c = sd_r_xored33;
+      assign sd_r_x16_0_c   = sd_r_x16_0;
+      assign sd_r_x16_1_c   = sd_r_x16_1;
+      assign sd_r_xf4_00_c  = sd_r_xf4_00;
+      assign sd_r_xf4_11_c  = sd_r_xf4_11;
+      assign sd_r_xf4_22_c  = sd_r_xf4_22;
+      assign sd_r_xf4_33_c  = sd_r_xf4_33;
+      assign sd_r_pp3_c     = sd_r_pp3;
+      assign sd_zq8_0_c     = sd_zq8_0;
+      assign sd_zq8_1_c     = sd_zq8_1;
+      assign sd_zq8_2_c     = sd_zq8_2;
+      assign sd_zq8_3_c     = sd_zq8_3;
+      assign sd_zq16_0_c    = sd_zq16_0;
+      assign sd_zq16_1_c    = sd_zq16_1;
+      assign sd_f4z_c       = sd_f4z_q;
+      assign sd_sgn_c       = sd_sgn_q;
+      assign sd_isfp8_c     = sd_isfp8_q;
+      assign sd_isfp4_c     = sd_isfp4_q;
+      assign sd_dpen_c      = sd_dpen_q;
+      assign sd_fs49_c      = sd_fs49_b1;
+      assign sd_fs48_c      = sd_fs48_b1;
+      assign sd_fs0_c       = sd_fs0_b1;
+      assign sd_fs_lo_z_c   = sd_fs_lo_z_b1;
+      assign sd_sign_c      = sd_sign_b1;
+      assign sd_x_nondp_c   = sd_x_nondp_b1;
+      assign sd_x_dp_c      = sd_x_dp_b1;
+      assign sd_x_int_c     = sd_x_int_b1;
+    end else begin : g_sd_cmp2
+      always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+          sd_r_xored00_c <= 2'd0;
+          sd_r_xored11_c <= 2'd0;
+          sd_r_xored22_c <= 2'd0;
+          sd_r_xored33_c <= 2'd0;
+          sd_r_x16_0_c   <= 2'd0;
+          sd_r_x16_1_c   <= 2'd0;
+          sd_r_xf4_00_c  <= 2'd0;
+          sd_r_xf4_11_c  <= 2'd0;
+          sd_r_xf4_22_c  <= 2'd0;
+          sd_r_xf4_33_c  <= 2'd0;
+          for (int i = 0; i < 4; i++) sd_r_pp3_c[i] <= 2'd0;
+          sd_zq8_0_c   <= 1'b1;
+          sd_zq8_1_c   <= 1'b1;
+          sd_zq8_2_c   <= 1'b1;
+          sd_zq8_3_c   <= 1'b1;
+          sd_zq16_0_c  <= 1'b1;
+          sd_zq16_1_c  <= 1'b1;
+          sd_f4z_c     <= '1;
+          sd_sgn_c     <= '0;
+          sd_isfp8_c   <= 1'b0;
+          sd_isfp4_c   <= 1'b0;
+          sd_dpen_c    <= 1'b0;
+          sd_fs49_c    <= 1'b0;
+          sd_fs48_c    <= 1'b0;
+          sd_fs0_c     <= 1'b0;
+          sd_fs_lo_z_c <= 1'b1;
+          sd_sign_c    <= 1'b0;
+          sd_x_nondp_c <= 2'd0;
+          sd_x_dp_c    <= 2'd0;
+          sd_x_int_c   <= 2'd0;
+        end else if (pipe_en) begin
+          sd_r_xored00_c <= sd_r_xored00;
+          sd_r_xored11_c <= sd_r_xored11;
+          sd_r_xored22_c <= sd_r_xored22;
+          sd_r_xored33_c <= sd_r_xored33;
+          sd_r_x16_0_c   <= sd_r_x16_0;
+          sd_r_x16_1_c   <= sd_r_x16_1;
+          sd_r_xf4_00_c  <= sd_r_xf4_00;
+          sd_r_xf4_11_c  <= sd_r_xf4_11;
+          sd_r_xf4_22_c  <= sd_r_xf4_22;
+          sd_r_xf4_33_c  <= sd_r_xf4_33;
+          for (int i = 0; i < 4; i++) sd_r_pp3_c[i] <= sd_r_pp3[i];
+          sd_zq8_0_c   <= sd_zq8_0;
+          sd_zq8_1_c   <= sd_zq8_1;
+          sd_zq8_2_c   <= sd_zq8_2;
+          sd_zq8_3_c   <= sd_zq8_3;
+          sd_zq16_0_c  <= sd_zq16_0;
+          sd_zq16_1_c  <= sd_zq16_1;
+          sd_f4z_c     <= sd_f4z_q;
+          sd_sgn_c     <= sd_sgn_q;
+          sd_isfp8_c   <= sd_isfp8_q;
+          sd_isfp4_c   <= sd_isfp4_q;
+          sd_dpen_c    <= sd_dpen_q;
+          sd_fs49_c    <= sd_fs49_b1;
+          sd_fs48_c    <= sd_fs48_b1;
+          sd_fs0_c     <= sd_fs0_b1;
+          sd_fs_lo_z_c <= sd_fs_lo_z_b1;
+          sd_sign_c    <= sd_sign_b1;
+          sd_x_nondp_c <= sd_x_nondp_b1;
+          sd_x_dp_c    <= sd_x_dp_b1;
+          sd_x_int_c   <= sd_x_int_b1;
+        end
+      end
+    end
+
+    // ---- B2: lane muxing, wrap count, corrections, compare.
+    // Lane addend residues; selects re-derived from the staged mode bits.
+    // All concatenation paddings are even shifts (2^even == 1 mod 3) and sign
+    // extension adds bit47 * 3 * 2^48 == 0 mod 3.
+    logic sd_sel_fp8, sd_sel_fp16, sd_sel_fp4;
+    assign sd_sel_fp8  = sd_isfp8_c && (~sd_isfp4_c) && sd_dpen_c;
+    assign sd_sel_fp16 = (~sd_isfp8_c) && (~sd_isfp4_c) && sd_dpen_c;
+    assign sd_sel_fp4  = sd_isfp4_c && sd_dpen_c;
+    res3_t sd_r_lane0, sd_r_lane1, sd_r_lane2, sd_r_lane3;
+    assign sd_r_lane0 = sd_sel_fp8 ? sd_r_xored00_c : sd_sel_fp16 ? sd_r_x16_0_c : sd_sel_fp4 ? sd_r_xf4_00_c : sd_r_pp3_c[0];
+    assign sd_r_lane1 = sd_sel_fp8 ? sd_r_xored11_c : sd_sel_fp16 ? sd_r_x16_1_c : sd_sel_fp4 ? sd_r_xf4_11_c : sd_r_pp3_c[1];
+    assign sd_r_lane2 = sd_sel_fp8 ? sd_r_xored22_c : sd_sel_fp16 ? 2'd0         : sd_sel_fp4 ? sd_r_xf4_22_c : sd_r_pp3_c[2];
+    assign sd_r_lane3 = sd_sel_fp8 ? sd_r_xored33_c : sd_sel_fp16 ? 2'd0         : sd_sel_fp4 ? sd_r_xf4_33_c : sd_r_pp3_c[3];
+
+    logic sd_fs49, sd_fs48, sd_fs0, sd_fs_lo_z;
+    assign sd_fs49    = sd_fs49_c;
+    assign sd_fs48    = sd_fs48_c;
+    assign sd_fs0     = sd_fs0_c;
+    assign sd_fs_lo_z = sd_fs_lo_z_c;
+
+    // 50-bit compressor wrap correction:
+    // r(final_sum) = sum(r_lane) - K + final_sum[49] (mod 3); 2^50 == 1 mod 3
+    // and the signed sum of four 48-bit-signed terms cannot overflow 50 bits.
+    // K (number of negative sign-extended addends) is derived in-shadow: a
+    // lane is negative iff its negate was taken on a nonzero shifted value
+    // (leading-zero payload packing keeps positive lanes' sign bits low).
+    logic sd_kn0, sd_kn1, sd_kn2, sd_kn3;
+    assign sd_kn0 = sd_sel_fp8  ? (sd_sgn_c[0] && !sd_zq8_0_c)
+                  : sd_sel_fp16 ? (sd_sgn_c[0] && !sd_zq16_0_c)
+                  : sd_sel_fp4  ? (sd_sgn_c[0] && !sd_f4z_c[0]) : 1'b0;
+    assign sd_kn1 = sd_sel_fp8  ? (sd_sgn_c[1] && !sd_zq8_1_c)
+                  : sd_sel_fp16 ? (sd_sgn_c[1] && !sd_zq16_1_c)
+                  : sd_sel_fp4  ? (sd_sgn_c[1] && !sd_f4z_c[1]) : 1'b0;
+    assign sd_kn2 = sd_sel_fp8  ? (sd_sgn_c[2] && !sd_zq8_2_c)
+                  : sd_sel_fp4  ? (sd_sgn_c[2] && !sd_f4z_c[2]) : 1'b0;
+    assign sd_kn3 = sd_sel_fp8  ? (sd_sgn_c[3] && !sd_zq8_3_c)
+                  : sd_sel_fp4  ? (sd_sgn_c[3] && !sd_f4z_c[3]) : 1'b0;
+    res3_t sd_r_k;
+    assign sd_r_k = sd_add3(sd_add3({1'b0, sd_kn0}, {1'b0, sd_kn1}),
+                            sd_add3({1'b0, sd_kn2}, {1'b0, sd_kn3}));
+    res3_t sd_r_fs, sd_r_mag;
+    assign sd_r_fs = sd_add3(sd_sub3(sd_add3(sd_add3(sd_r_lane0, sd_r_lane1),
+                                             sd_add3(sd_r_lane2, sd_r_lane3)), sd_r_k),
+                             {1'b0, sd_fs49});
+    // The magnitude negate is taken only when final_sum[49] == 1, which
+    // implies final_sum != 0, so identity 4 needs no zero corner here.
+    assign sd_r_mag = sd_fs49 ? sd_sub3(2'd1, sd_r_fs) : sd_r_fs;
+
+    // Magnitude bits reconstructed from the registered final_sum:
+    //   mag[0]  == fs[0] (negation preserves bit 0),
+    //   mag[49] == fs[49] & (fs[48:0] == 0) (only fs == -2^49),
+    //   mag[48] is consumed only in the fp4 branch, where each lane term is
+    //   bounded by (2^22 - 2^13) * 2^24 (9-bit fp4 magnitude ports), so
+    //   |fs| <= 2^48 - 2^39 < 2^48 and mag[49:48] == 0 structurally.
+    logic sd_mag49, sd_mag0, sd_fs_nz;
+    assign sd_mag49 = sd_fs49 && sd_fs_lo_z;
+    assign sd_mag0  = sd_fs0;
+    assign sd_fs_nz = sd_fs49 || !sd_fs_lo_z;
+
+    res3_t sd_pred_nondp, sd_pred_dp, sd_pred_int;
+    logic  sd_pred_sign;
+    // non-dp: final_sum[47:0] -> subtract the two dropped top bits
+    // (2^49 == 2, 2^48 == 1: the dropped value is canon({fs49, fs48})).
+    assign sd_pred_nondp = sd_sub3(sd_r_fs, sd_canon3({sd_fs49, sd_fs48}));
+    // is_fp4: mag[47:0] -> the dropped top bits are structurally zero;
+    // else:   mag[48:1] -> subtract bit 49 (weight 2) and bit 0 (weight 1),
+    //         then divide by 2 (== multiply by 2 mod 3).
+    assign sd_pred_dp = sd_isfp4_c
+        ? sd_r_mag
+        : sd_mulpow2(sd_sub3(sd_r_mag, sd_canon3({sd_mag49, sd_mag0})), 1'b1);
+    assign sd_pred_int  = sd_r_fs;
+    assign sd_pred_sign = sd_dpen_c ? (sd_fs_nz ? sd_fs49 : 1'b0) : 1'b0;
+
+    // ---- compare against the B1-captured extraction residues and sign
+    logic [3:0] sd_alarm_d;
+    assign sd_alarm_d[0] = (sd_x_nondp_c != sd_pred_nondp);
+    assign sd_alarm_d[1] = (sd_x_dp_c    != sd_pred_dp);
+    assign sd_alarm_d[2] = (sd_x_int_c   != sd_pred_int);
+    assign sd_alarm_d[3] = (sd_sign_c    != sd_pred_sign);
+
+`ifdef COMBINATIONAL
+    assign safedot_alarm_o = sd_alarm_d;
+`else
+    logic [3:0] sd_alarm_q;
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+      if (!rst_ni) sd_alarm_q <= '0;
+      else         sd_alarm_q <= sd_alarm_d;
+    end
+    assign safedot_alarm_o = sd_alarm_q;
+`endif
+
+  end else begin : g_safedot_off
+    assign safedot_alarm_o = '0;
+  end endgenerate
+`else
+  assign safedot_alarm_o = '0;
 `endif
 
 endmodule
