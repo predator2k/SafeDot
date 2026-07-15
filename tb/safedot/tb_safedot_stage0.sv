@@ -388,6 +388,17 @@ module tb_safedot_stage0;
     release dut.g_safedot.sd_ra_seg_q[0];
     settle();
 
+    // 9) dp output register corruption (dp mode, so the v4-consolidated fp
+    // extraction tree is reading product_dp_q on this operation).
+    drive_directed(8);
+    repeat (2) @(negedge clk);
+    @(posedge clk); #0.1;
+    t_prod = dut.product_dp_q ^ 48'h10;
+    force dut.product_dp_q = t_prod;
+    inject_and_check("product_dp_q^bit4 (dp fp16)");
+    release dut.product_dp_q;
+    settle();
+
     $display("TB: injection phase: %0d/%0d detected", n_detected, n_inject);
 
     if (n_errors == 0 && n_detected == n_inject)

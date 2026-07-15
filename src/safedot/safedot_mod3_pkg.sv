@@ -28,6 +28,17 @@ package safedot_mod3_pkg;
     return sd_canon3(f);
   endfunction
 
+  // (a + b) as a redundant mod-3 digit: end-around-carry addition WITHOUT
+  // the final canonicalization. The digit domain {0,1,2,3} (3 == 0) is
+  // closed under this add: a + b <= 6, and the folded s + c never exceeds 3.
+  // Used inside the extraction trees so canonicalization happens once at the
+  // tree root instead of at every node.
+  function automatic res3_t sd_add3_r(input logic [1:0] a, input logic [1:0] b);
+    logic [2:0] s;
+    s = {1'b0, a} + {1'b0, b};       // max 6
+    return s[1:0] + {1'b0, s[2]};    // end-around carry, max 3
+  endfunction
+
   // (-x) mod 3: 0->0, 1->2, 2->1 (bit swap; 3 canonicalizes to 0).
   function automatic res3_t sd_neg3(input logic [1:0] x);
     return sd_canon3({x[0], x[1]});

@@ -53,7 +53,9 @@ module safedot_mod3_shiftneg #(
   assign kept_live = x_live_i & ~mask_live;
 
   res3_t r_disc_live, r_disc, r_shift;
-  safedot_mod3_reduce #(.W(LW)) u_rdisc (
+  // Redundant digit is fine here: r_disc_live only feeds sd_mulpow2, which
+  // canonicalizes internally.
+  safedot_mod3_reduce #(.W(LW), .CANON(1'b0)) u_rdisc (
     .x_i(disc_live),
     .r_o(r_disc_live)
   );

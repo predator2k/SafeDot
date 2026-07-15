@@ -698,7 +698,7 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
 `endif
 
   // --------------------------------------------------------------------------
-  // SafeDot mod-3 residue shadow (stage-0 probe, v2 staging; docs/SafeDot.md
+  // SafeDot mod-3 residue shadow (stage-0 probe, v4 staging; docs/SafeDot.md
   // sec. 5.1/5.2/8.1).
   //
   // Launch cycle: ONLY raw taps of main-path nets are captured into shadow
@@ -707,16 +707,24 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
   // arithmetic is stacked on main-path logic in the launch cycle, so the
   // shadow cannot set the block's Fmax wall (v1 computed the lane/wrap chain
   // in the launch cycle and was measured to move the wall by ~100 ps).
-  // Compare cycle: the full residue chain (partial-product residues, lane
-  // shift/negate identities 4/5, 50-bit wrap correction, output predictions),
-  // the residue extraction from the registered outputs, and the compare.
+  // Compare cycle (optionally split in two with SAFEDOT_CMP_STAGES=2): the
+  // full residue chain (partial-product residues, lane shift/negate
+  // identities 4/5, 50-bit wrap correction with the in-shadow-derived wrap
+  // count K, output predictions), the residue extraction from the registered
+  // outputs, and the compare.
   //
-  // Taps registered in the launch cycle:
-  //   - pp[i][i][7:0] fp8/int4 lane payloads and pp3_res[0]/[3] fp16 payloads
-  //     (identity-5 discarded-segment extraction happens post-register),
-  //   - shamts / lane signs / mode decodes consumed by the shadow math,
-  //   - the four addend sign bits (50-bit wrap count K),
-  //   - final_sum[49:48], final_sum_mag[49]/[48]/[0], independent |final_sum.
+  // Taps registered in the launch cycle (v3/v4): the early lane payloads
+  // pp[i][i][7:0] and pp3_res[0]/[3] (identity-5 discarded-segment extraction
+  // happens post-register), plus shamts / lane signs / mode decodes. The
+  // final_sum correction bits are read from the registered int output in the
+  // compare cycle, so no late main-path net is pinned to a pipeline stage.
+  //
+  // v4 output checkpoints: two extraction trees — the int output (final_sum,
+  // canonical arithmetic checkpoint, always on) and the consumed fp output
+  // (product_dp_o when dp_enable, product_non_dp_o otherwise). Residue trees
+  // keep internal nodes in the redundant digit domain (safedot_mod3_reduce,
+  // canonicalization once at the root; SAFEDOT_TREE_LEGACY restores the
+  // per-node-canonical v3 trees for A/B).
   //
   // Relied-on input invariants (guaranteed by the FMA operand packer):
   //  - fp8/int4 DP (dp_enable_i && is_fp8 && !is_fp4): lane payloads keep
@@ -738,18 +746,21 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
     localparam int unsigned CmpStages = `SAFEDOT_CMP_STAGES;
 
     // ---- launch cycle: operand-side residues (module inputs only)
+    // Operand residues may stay in the redundant digit domain ({0..3},
+    // 3 == 0): every consumer below is a pkg helper that canonicalizes its
+    // inputs internally (sd_mul3 / sd_add3 / sd_mulpow2), never a raw ==.
     res3_t sd_ra_seg [0:NSEG-1];
     res3_t sd_rb_seg [0:NSEG-1];
     for (genvar gi = 0; gi < NSEG; gi++) begin : g_sd_opext
-      safedot_mod3_reduce #(.W(SEG_W)) u_sd_ra (.x_i(a_seg[gi]), .r_o(sd_ra_seg[gi]));
-      safedot_mod3_reduce #(.W(SEG_W)) u_sd_rb (.x_i(b_seg[gi]), .r_o(sd_rb_seg[gi]));
+      safedot_mod3_reduce #(.W(SEG_W), .CANON(1'b0)) u_sd_ra (.x_i(a_seg[gi]), .r_o(sd_ra_seg[gi]));
+      safedot_mod3_reduce #(.W(SEG_W), .CANON(1'b0)) u_sd_rb (.x_i(b_seg[gi]), .r_o(sd_rb_seg[gi]));
     end
 
     res3_t sd_r_fp4mag [0:3];
-    safedot_mod3_reduce #(.W(9)) u_sd_f4m0 (.x_i(fp4_y_mag0), .r_o(sd_r_fp4mag[0]));
-    safedot_mod3_reduce #(.W(9)) u_sd_f4m1 (.x_i(fp4_y_mag1), .r_o(sd_r_fp4mag[1]));
-    safedot_mod3_reduce #(.W(9)) u_sd_f4m2 (.x_i(fp4_y_mag2), .r_o(sd_r_fp4mag[2]));
-    safedot_mod3_reduce #(.W(9)) u_sd_f4m3 (.x_i(fp4_y_mag3), .r_o(sd_r_fp4mag[3]));
+    safedot_mod3_reduce #(.W(9), .CANON(1'b0)) u_sd_f4m0 (.x_i(fp4_y_mag0), .r_o(sd_r_fp4mag[0]));
+    safedot_mod3_reduce #(.W(9), .CANON(1'b0)) u_sd_f4m1 (.x_i(fp4_y_mag1), .r_o(sd_r_fp4mag[1]));
+    safedot_mod3_reduce #(.W(9), .CANON(1'b0)) u_sd_f4m2 (.x_i(fp4_y_mag2), .r_o(sd_r_fp4mag[2]));
+    safedot_mod3_reduce #(.W(9), .CANON(1'b0)) u_sd_f4m3 (.x_i(fp4_y_mag3), .r_o(sd_r_fp4mag[3]));
     logic [3:0] sd_f4z_d;
     assign sd_f4z_d = {~(|fp4_y_mag3), ~(|fp4_y_mag2), ~(|fp4_y_mag1), ~(|fp4_y_mag0)};
 
@@ -909,16 +920,26 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
 
     // ---- B1 captures of the checked outputs (operation-N aligned):
     // fs bits from the registered int output, extraction residues, sign_out.
+    //
+    // v4 output-checkpoint consolidation: two extraction trees instead of
+    // three. The int output (final_sum itself) is checked unconditionally as
+    // the canonical arithmetic checkpoint — it covers every upstream stage
+    // and is the consumed output in INT DP mode. Of the two fp outputs, only
+    // the one the FMA consumes this cycle is read (dp modes consume
+    // product_dp_o, scalar/simd consume product_non_dp_o); a fault confined
+    // to the unconsumed output register bank is architecturally silent and
+    // is flagged on the first cycle that bank is consumed.
     logic sd_fs49_b1, sd_fs48_b1, sd_fs0_b1, sd_fs_lo_z_b1, sd_sign_b1;
-    res3_t sd_x_nondp_b1, sd_x_dp_b1, sd_x_int_b1;
+    res3_t sd_x_fp_b1, sd_x_int_b1;
+    logic [47:0] sd_x_fp_vec_b1;
     assign sd_fs49_b1    = product_int_dp_o[49];
     assign sd_fs48_b1    = product_int_dp_o[48];
     assign sd_fs0_b1     = product_int_dp_o[0];
     assign sd_fs_lo_z_b1 = ~(|product_int_dp_o[48:0]);
     assign sd_sign_b1    = sign_out;
-    safedot_mod3_reduce #(.W(48)) u_sd_x_nondp (.x_i(product_non_dp_o), .r_o(sd_x_nondp_b1));
-    safedot_mod3_reduce #(.W(48)) u_sd_x_dp    (.x_i(product_dp_o),     .r_o(sd_x_dp_b1));
-    safedot_mod3_reduce #(.W(50)) u_sd_x_int   (.x_i(product_int_dp_o), .r_o(sd_x_int_b1));
+    assign sd_x_fp_vec_b1 = sd_dpen_q ? product_dp_o : product_non_dp_o;
+    safedot_mod3_reduce #(.W(48)) u_sd_x_fp  (.x_i(sd_x_fp_vec_b1),    .r_o(sd_x_fp_b1));
+    safedot_mod3_reduce #(.W(50)) u_sd_x_int (.x_i(product_int_dp_o), .r_o(sd_x_int_b1));
 
     // ---- B1/B2 boundary: wires for CmpStages == 1, a register stage for
     // CmpStages == 2 (so each shadow stage fits a high-frequency cycle).
@@ -931,7 +952,7 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
     logic [3:0] sd_f4z_c, sd_sgn_c;
     logic  sd_isfp8_c, sd_isfp4_c, sd_dpen_c;
     logic  sd_fs49_c, sd_fs48_c, sd_fs0_c, sd_fs_lo_z_c, sd_sign_c;
-    res3_t sd_x_nondp_c, sd_x_dp_c, sd_x_int_c;
+    res3_t sd_x_fp_c, sd_x_int_c;
     if (CmpStages == 1) begin : g_sd_cmp1
       assign sd_r_xored00_c = sd_r_xored00;
       assign sd_r_xored11_c = sd_r_xored11;
@@ -960,8 +981,7 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
       assign sd_fs0_c       = sd_fs0_b1;
       assign sd_fs_lo_z_c   = sd_fs_lo_z_b1;
       assign sd_sign_c      = sd_sign_b1;
-      assign sd_x_nondp_c   = sd_x_nondp_b1;
-      assign sd_x_dp_c      = sd_x_dp_b1;
+      assign sd_x_fp_c      = sd_x_fp_b1;
       assign sd_x_int_c     = sd_x_int_b1;
     end else begin : g_sd_cmp2
       always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -993,8 +1013,7 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
           sd_fs0_c     <= 1'b0;
           sd_fs_lo_z_c <= 1'b1;
           sd_sign_c    <= 1'b0;
-          sd_x_nondp_c <= 2'd0;
-          sd_x_dp_c    <= 2'd0;
+          sd_x_fp_c    <= 2'd0;
           sd_x_int_c   <= 2'd0;
         end else if (pipe_en) begin
           sd_r_xored00_c <= sd_r_xored00;
@@ -1024,8 +1043,7 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
           sd_fs0_c     <= sd_fs0_b1;
           sd_fs_lo_z_c <= sd_fs_lo_z_b1;
           sd_sign_c    <= sd_sign_b1;
-          sd_x_nondp_c <= sd_x_nondp_b1;
-          sd_x_dp_c    <= sd_x_dp_b1;
+          sd_x_fp_c    <= sd_x_fp_b1;
           sd_x_int_c   <= sd_x_int_b1;
         end
       end
@@ -1103,13 +1121,17 @@ module transdot_decomp_multiplier_w6_4lane_dp_piped #(
         : sd_mulpow2(sd_sub3(sd_r_mag, sd_canon3({sd_mag49, sd_mag0})), 1'b1);
     assign sd_pred_int  = sd_r_fs;
     assign sd_pred_sign = sd_dpen_c ? (sd_fs_nz ? sd_fs49 : 1'b0) : 1'b0;
+    // v4: the fp extraction tree read the consumed output (dp when
+    // sd_dpen, non-dp otherwise) — select the matching prediction.
+    res3_t sd_pred_fp;
+    assign sd_pred_fp = sd_dpen_c ? sd_pred_dp : sd_pred_nondp;
 
     // ---- compare against the B1-captured extraction residues and sign
     logic [3:0] sd_alarm_d;
-    assign sd_alarm_d[0] = (sd_x_nondp_c != sd_pred_nondp);
-    assign sd_alarm_d[1] = (sd_x_dp_c    != sd_pred_dp);
-    assign sd_alarm_d[2] = (sd_x_int_c   != sd_pred_int);
-    assign sd_alarm_d[3] = (sd_sign_c    != sd_pred_sign);
+    assign sd_alarm_d[0] = (sd_x_fp_c  != sd_pred_fp);
+    assign sd_alarm_d[1] = 1'b0;  // freed by the v4 consolidation
+    assign sd_alarm_d[2] = (sd_x_int_c != sd_pred_int);
+    assign sd_alarm_d[3] = (sd_sign_c  != sd_pred_sign);
 
 `ifdef COMBINATIONAL
     assign safedot_alarm_o = sd_alarm_d;
