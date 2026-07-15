@@ -217,6 +217,145 @@ module safedot_stage0_base (
 endmodule
 
 
+// DMR reference anchor (docs/SafeDot.md sec. 9.2 baseline): the multiplier
+// core duplicated behind SHARED input registers (a real DMR duplicates the
+// datapath, not the upstream registers), with a full-width compare of all
+// registered outputs one cycle later — the same alarm latency as the mod-3
+// shadow at SAFEDOT_CMP_STAGES=1. No retiming-seed support; the anchor
+// point is the relaxed clock.
+module safedot_stage0_dmr (
+  input  logic        clk_i,
+  input  logic        rst_ni,
+  input  logic        dp_enable_i,
+  input  logic        simd_enable_i,
+  input  logic        is_fp8_i,
+  input  logic        is_fp4_i,
+  input  logic [5:0]  shamt_lane0_i,
+  input  logic [5:0]  shamt_lane1_i,
+  input  logic [4:0]  shamt_lane2_i,
+  input  logic [4:0]  shamt_lane3_i,
+  input  logic        sign_lane0_i,
+  input  logic        sign_lane1_i,
+  input  logic        sign_lane2_i,
+  input  logic        sign_lane3_i,
+  input  logic [8:0]  fp4_y_mag0_i,
+  input  logic [8:0]  fp4_y_mag1_i,
+  input  logic [8:0]  fp4_y_mag2_i,
+  input  logic [8:0]  fp4_y_mag3_i,
+  input  logic [23:0] mantissa_a_i,
+  input  logic [23:0] mantissa_b_i,
+  output logic [47:0] product_non_dp_o,
+  output logic [47:0] product_dp_o,
+  output logic [49:0] product_int_dp_o,
+  output logic        sign_o,
+  output logic [3:0]  safedot_alarm_o
+);
+  logic        dp_enable_q, simd_enable_q, is_fp8_q, is_fp4_q;
+  logic [5:0]  shamt_lane0_q, shamt_lane1_q;
+  logic [4:0]  shamt_lane2_q, shamt_lane3_q;
+  logic        sign_lane0_q, sign_lane1_q, sign_lane2_q, sign_lane3_q;
+  logic [8:0]  fp4_y_mag0_q, fp4_y_mag1_q, fp4_y_mag2_q, fp4_y_mag3_q;
+  logic [23:0] mantissa_a_q, mantissa_b_q;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      dp_enable_q   <= 1'b0;
+      simd_enable_q <= 1'b0;
+      is_fp8_q      <= 1'b0;
+      is_fp4_q      <= 1'b0;
+      shamt_lane0_q <= '0;
+      shamt_lane1_q <= '0;
+      shamt_lane2_q <= '0;
+      shamt_lane3_q <= '0;
+      sign_lane0_q  <= 1'b0;
+      sign_lane1_q  <= 1'b0;
+      sign_lane2_q  <= 1'b0;
+      sign_lane3_q  <= 1'b0;
+      fp4_y_mag0_q  <= '0;
+      fp4_y_mag1_q  <= '0;
+      fp4_y_mag2_q  <= '0;
+      fp4_y_mag3_q  <= '0;
+      mantissa_a_q  <= '0;
+      mantissa_b_q  <= '0;
+    end else begin
+      dp_enable_q   <= dp_enable_i;
+      simd_enable_q <= simd_enable_i;
+      is_fp8_q      <= is_fp8_i;
+      is_fp4_q      <= is_fp4_i;
+      shamt_lane0_q <= shamt_lane0_i;
+      shamt_lane1_q <= shamt_lane1_i;
+      shamt_lane2_q <= shamt_lane2_i;
+      shamt_lane3_q <= shamt_lane3_i;
+      sign_lane0_q  <= sign_lane0_i;
+      sign_lane1_q  <= sign_lane1_i;
+      sign_lane2_q  <= sign_lane2_i;
+      sign_lane3_q  <= sign_lane3_i;
+      fp4_y_mag0_q  <= fp4_y_mag0_i;
+      fp4_y_mag1_q  <= fp4_y_mag1_i;
+      fp4_y_mag2_q  <= fp4_y_mag2_i;
+      fp4_y_mag3_q  <= fp4_y_mag3_i;
+      mantissa_a_q  <= mantissa_a_i;
+      mantissa_b_q  <= mantissa_b_i;
+    end
+  end
+
+  logic [47:0] pnd [2];
+  logic [47:0] pdp [2];
+  logic [49:0] pint [2];
+  logic        sgn [2];
+  logic [3:0]  alm_nc [2];
+
+  for (genvar gi = 0; gi < 2; gi++) begin : g_dmr_core
+    transdot_decomp_multiplier_w6_4lane_dp_piped #(
+      .PRECISION_BITS ( 24 ),
+      .SAFEDOT_CHECK  ( 1'b0 )
+    ) i_mult (
+      .clk_i            ( clk_i ),
+      .rst_ni           ( rst_ni ),
+      .pipe_en          ( 1'b1 ),
+      .dp_enable_i      ( dp_enable_q ),
+      .simd_enable_i    ( simd_enable_q ),
+      .is_fp8           ( is_fp8_q ),
+      .is_fp4           ( is_fp4_q ),
+      .shamt_lane0      ( shamt_lane0_q ),
+      .shamt_lane1      ( shamt_lane1_q ),
+      .shamt_lane2      ( shamt_lane2_q ),
+      .shamt_lane3      ( shamt_lane3_q ),
+      .sign_lane0       ( sign_lane0_q ),
+      .sign_lane1       ( sign_lane1_q ),
+      .sign_lane2       ( sign_lane2_q ),
+      .sign_lane3       ( sign_lane3_q ),
+      .fp4_y_mag0       ( fp4_y_mag0_q ),
+      .fp4_y_mag1       ( fp4_y_mag1_q ),
+      .fp4_y_mag2       ( fp4_y_mag2_q ),
+      .fp4_y_mag3       ( fp4_y_mag3_q ),
+      .mantissa_a       ( mantissa_a_q ),
+      .mantissa_b       ( mantissa_b_q ),
+      .product_non_dp_o ( pnd[gi] ),
+      .product_dp_o     ( pdp[gi] ),
+      .sign_out         ( sgn[gi] ),
+      .product_int_dp_o ( pint[gi] ),
+      .safedot_alarm_o  ( alm_nc[gi] )
+    );
+  end
+
+  assign product_non_dp_o = pnd[0];
+  assign product_dp_o     = pdp[0];
+  assign product_int_dp_o = pint[0];
+  assign sign_o           = sgn[0];
+
+  logic mismatch_d;
+  assign mismatch_d = (pnd[0] != pnd[1]) || (pdp[0] != pdp[1])
+                   || (pint[0] != pint[1]) || (sgn[0] != sgn[1]);
+  logic [3:0] alarm_q;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) alarm_q <= '0;
+    else         alarm_q <= {3'b0, mismatch_d};
+  end
+  assign safedot_alarm_o = alarm_q;
+endmodule
+
+
 module safedot_stage0_mod3 (
   input  logic        clk_i,
   input  logic        rst_ni,
