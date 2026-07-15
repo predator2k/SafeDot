@@ -109,6 +109,22 @@ RTL:影子逻辑内联于 piped 乘法器(参数 `SAFEDOT_CHECK` + 宏 `SAFEDOT_
 - 影子子模块面积 FPU 级 294.7–299.4 µm² ≈ 隔离块 303.0 µm²,实例化一致;报警锥在 FMA 未连接 `safedot_alarm_o` 的情况下由 `-no_boundary_optimization` 保全(网表证实 alarm 寄存器与两棵提取树在位),集成时接到顶层即可。
 - 对照第 7 章与 3.1 节:修订估计"乘法器的 20–25% ≈ FPU 的 7–9%"实测为**乘法器的 32% ≈ FPU 的 9.8%**,略超上限;注意分母是 ADDMUL-only FPU,含 div/sqrt/conv 的全 FPU 百分比会进一步稀释。
 
+### 3.5 模数参数化与 mod 3/15/63 Pareto 实测(阶段 1,2026-07-14/15)
+
+校验器已按 K 位数字全参数化(模数 m=2^K−1,`+define+SAFEDOT_K`,默认 2):残差原语迁入 `src/safedot/safedot_res.svh`(SV package 不可参数化,以 localparam+include 进入各参数化作用域),K=2 与既有 v4 位级等价(3 配置 × 300k + 9/9 注入复验)。K-通式化揪出三处 mod-3 恒等式的"隐形退化"并显式化:移位恒等式中载荷的 2^LO 场内放置(LO 偶数时 mod 3 不可见,K=6 随机验证 24k 周期内即以误报暴露——参数化本身就是对推导的测试)、lane 帧放置旋转(0/12/24)、符号扩展常数 C_EXT=2^(48%K)+2^(49%K)(仅 K=2 为零),后者与 2^50 回绕折并为单常数 CD。K=4/6 各 300k 周期零误报、9/9 注入;FMA 级回归在 K=2 与 K=6 影子实弹下均 21,510/21,510、零报警。
+
+**Pareto 实测(隔离块,1800 ps;K≥4 需 c2 两拍比较——单拍影子链装不下 4×4/6×6 数字乘,cmp1 下 WNS −607/−770 全在影子锥内,主通路不受扰)**:
+
+| 模数 | 配置 | 面积 (µm²) | 校验器增量 | 相对 mod3 | 随机错误逃逸率 | 时序 (DC/PT) |
+|---|---|---|---|---|---|---|
+| mod 3 (K=2) | cmp1 | 2099.5 | +527.3(+33.5%) | 1× | ~33% | **收敛**(PT 无违例) |
+| mod 15 (K=4) | cmp2 | 2591.0 | +1018.8(+64.8%) | 1.93× | ~6.7% | **收敛**(DC +0.7,PT 无违例) |
+| mod 63 (K=6) | cmp2 | 3200.2 | +1628.0(+103.5%) | 3.09× | ~1.6% | PT −63.9(RVT-only 口径内;严格收敛需三拍比较) |
+
+- 检错语义随模数的取舍:单比特错误三档均 100% 检出;双比特错误 mod 3 约半数混叠逃逸而 mod 63 同向对全检出/异向仅 1/6 逃逸;多比特/突发(时序错误的现实形态)按 ~1/m 逃逸。
+- 按"校验器增量局限于乘法器作用域"外推集成占比:mod 3 实测 9.8% FPU → mod 15 ≈ 19% → mod 63 ≈ 30%。**第 7 章的预算判断证实:8–12% FPU 预算内仅 mod 3 可行;mod 63 树面积 ×3 的预测与实测(3.09×)偏差 <3%**;mod 15 以约 2× 校验器成本换 5 倍混叠压缩(33%→6.7%),是预算翻倍情形下的中间选项。
+- K≥4 的报警延迟为输出后 2 拍(c2);1800 ps 下 cmp1 只有 K=2 可行。双模数并行(3∥5,近似 mod-15 覆盖)未实测,留作候选。
+
 ## 4 复现命令
 
 ```bash
@@ -127,6 +143,9 @@ TOPS=safedot_stage0_mod3 CLKS=600 STAGES=4 CMP=2 ./run_stage0_syn.sh
 # v4 变体 A/B(VTAG 隔离结果目录;EXTRA_DEFS 注入宏;0.8 ns 收敛配置用传统树)
 TOPS=safedot_stage0_mod3 CLKS=1800 VTAG=v4b ./run_stage0_syn.sh
 TOPS=safedot_stage0_mod3 CLKS=800 STAGES=1 VTAG=v4a EXTRA_DEFS="+SAFEDOT_TREE_LEGACY" ./run_stage0_syn.sh
+# 模数 Pareto(K≥4 需两拍比较)
+TOPS=safedot_stage0_mod3 CLKS=1800 CMP=2 VTAG=k4 EXTRA_DEFS="+SAFEDOT_K=4" ./run_stage0_syn.sh
+TOPS=safedot_stage0_mod3 CLKS=1800 CMP=2 VTAG=k6 EXTRA_DEFS="+SAFEDOT_K=6" ./run_stage0_syn.sh
 # FPU 级集成 A/B(transdot_fpu_top,SAFEDOT_FL 换填 FPU 文件列表)
 TDEF="+TRANSDOT_ENABLE+USE_TRANSDOT_MULTIPLIER+USE_TRANSDOT_EXPONENT_DATAPATH+USE_TRANSDOT_ADDEND_DATAPATH+USE_TRANSDOT_NORMALIZE_DATAPATH+FP4_INCLUDED"
 TOPS=transdot_fpu_top SAFEDOT_FL=safedot_fpu_syn.f CLKS=2100 VTAG=fpu0 EXTRA_DEFS="$TDEF" ./run_stage0_syn.sh
@@ -142,6 +161,6 @@ python3 ../classify_endpoint_slack.py ../results/<tag>/pt/<top>.pt.endpoint_slac
 1. **可行性**:mod-3 余数校验器在真实多模式 DPA 乘法器上功能完备且经受了 6.4 节所警告的角例考验(取负零、回绕计数、打包器不变式依赖均被 300k 随机向量击中并修正);检错语义与结果正确性对齐。
 2. **面积**:v4(输出检查点合并 + 冗余形式余数树)把隔离块增量从 +38.9% 压到 **+33.5%**(1800 收敛点,校验器 −13.9%);**FPU 级集成实测(2100 ps 收敛点,PT 无违例):+9.8% FPU / +32% 集成乘法器**——第 7 章估算的实测替代,略超修订估计上限(分母为 ADDMUL-only FPU,全 FPU 会稀释)。模数 Pareto 扫描仍是必答题。
 3. **时序**:0.8 ns 双方收敛(PT 签核口径;RVT-only 前提;v4 用 `SAFEDOT_TREE_LEGACY` 配置,冗余树在该点系统性差 ~15 ps);FPU 级墙 ~2040 ps 由 FPU 自身数据通路决定,校验器非限制因素(影子侧 WNS 反而更优)。0.6 ns 事项**按项目决定暂缓**。影子分级演进(v1→v4)的每一步教训都有实测支撑。
-4. **判据**:实测面积超出原估算,但经 v4 回收后可解释、可继续优化、不动摇 residue 路线选型;**阶段 1 已开工**,已完成:输出检查点合并、冗余形式余数树、FPU 级集成测量;下一项:**模数参数化(K 位数字,m=2^K−1)与 mod 3/15/63 Pareto 扫描**(×2^e = 数字域循环移位 e mod K、取负/截断常数 2^(FW mod K) 等 k=2 技巧均有 K-通式;SV package 不可参数化,原语随参数化模块携带)。
+4. **判据**:实测面积超出原估算,但经 v4 回收后可解释、可继续优化、不动摇 residue 路线选型;**阶段 1 已开工**,已完成:输出检查点合并、冗余形式余数树、FPU 级集成测量、**模数参数化与 mod 3/15/63 Pareto 实测(3.5 节)——预算内仅 mod 3 可行,mod 63 ×3 预测实测证实,mod 15 为预算翻倍时的中间选项**。后续:9.2 节其余矩阵维度(仅控制奇偶档、累加器随行余数档、RPR/DMR 基线锚点)、双模数并行候选、mod 63 的三拍比较收敛。
 
 *(功耗对比由独立的 pt_pwr 流程承担(建设中,非本文档范围);INT_DP_FMADD 的 FMA 级打通已完成,见第 2 节。)*
