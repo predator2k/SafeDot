@@ -118,13 +118,35 @@ RTL:影子逻辑内联于 piped 乘法器(参数 `SAFEDOT_CHECK` + 宏 `SAFEDOT_
 | 模数 | 配置 | 面积 (µm²) | 校验器增量 | 相对 mod3 | 随机错误逃逸率 | 时序 (DC/PT) |
 |---|---|---|---|---|---|---|
 | mod 3 (K=2) | cmp1 | 2099.5 | +527.3(+33.5%) | 1× | ~33% | **收敛**(PT 无违例) |
+| mod 7 (K=3) | cmp2 | 2329.0 | +756.8(+48.1%) | 1.44× | ~14.3% | **收敛**(DC +0.4,PT 无违例) |
 | mod 15 (K=4) | cmp2 | 2591.0 | +1018.8(+64.8%) | 1.93× | ~6.7% | **收敛**(DC +0.7,PT 无违例) |
+| mod 31 (K=5) | cmp2 | 2919.0 | +1346.8(+85.7%) | 2.55× | ~3.2% | DC −37.8 / PT −18.4,**可接受**(口径内) |
 | mod 63 (K=6) | cmp2 | 3200.2 | +1628.0(+103.5%) | 3.09× | ~1.6% | PT −63.9,**可接受**(~100 ps 口径;严格收敛才需三拍比较) |
 
-- 检错语义随模数的取舍:单比特错误三档均 100% 检出;双比特错误 mod 3 约半数混叠逃逸而 mod 63 同向对全检出/异向仅 1/6 逃逸;多比特/突发(时序错误的现实形态)按 ~1/m 逃逸。
-- **DMR 基线锚点(9.2 节参照实现,`safedot_stage0_dmr`:共享输入寄存器 + 双乘法器核 + 全宽输出比较,报警滞后 1 拍同 cmp1)**:1800 ps 实测 **+1545.7 µm²(+98.3%),DC/PT 双收敛**(1700:+90.0%,PT −30.5,口径内可接受)。对照结论:**mod 3 = DMR 成本的 34%**(以 ~33% 多比特混叠为代价);mod 15 = 66%;**mod 63(+103.5%)成本已超过 DMR 而覆盖率更低(~1.6% 逃逸 vs DMR 仅共模盲区)——在乘法器块粒度上被 DMR 支配**,残差路线的价值区间在低成本端。DMR 的对价:动态功耗同样翻倍、无法定位共模设计错误、对角点比较器本身无保护。RPR 锚点尚未实现(多模式 DPA 的降精度副本需先定义各模式的截断语义与容差比较——留待界定)。
+五档实测(2026-07-16 补 mod 7/31,K=3/5 各经乘法器与加数通路 TB 300k 周期 + 全注入验证,零 RTL 改动——参数化的直接红利):**成本近似随 K 线性(每数字位 ~+250–330 µm²),逃逸率每位减半**;cmp1 只有 K=2 装得下(K=3 的 3×3 数字乘已需两拍,cmp1 下 DC −124.8)。
+
+- 检错语义随模数的取舍:单比特错误各档均 100% 检出;**同向双比特混叠 2^i+2^j≡0 (mod 2^K−1) 仅在 K=2 有解(1+2=3)——mod 3 是全族中唯一对约半数同向双翻转失明的模数,K≥3 全检出**;异向双比特按 1/K 混叠;多比特/突发(时序错误的现实形态)按 ~1/m 逃逸。
+- **DMR 基线锚点(9.2 节参照实现,`safedot_stage0_dmr`:共享输入寄存器 + 双乘法器核 + 全宽输出比较,报警滞后 1 拍同 cmp1)**:1800 ps 实测 **+1545.7 µm²(+98.3%),DC/PT 双收敛**(1700:+90.0%,PT −30.5,口径内可接受)。对照结论:**mod 3 = DMR 成本的 34%,mod 7 = 49%,mod 15 = 66%,mod 31 = 87%;mod 63(+103.5%)成本超过 DMR 而覆盖率更低——DMR 支配边界落在 mod 31 与 mod 63 之间**,残差路线的价值区间在低成本端。DMR 的对价:动态功耗同样翻倍、无法定位共模设计错误、对角点比较器本身无保护。RPR 锚点尚未实现(多模式 DPA 的降精度副本需先定义各模式的截断语义与容差比较——留待界定)。
+- 按"校验器增量局限于被保护块作用域"外推集成占比(mod 3 实测 9.8% FPU):mod 7 ≈ 14%,mod 15 ≈ 19%,mod 31 ≈ 25%,mod 63 ≈ 30%。8–12% FPU 预算内仍仅 mod 3 可行;**mod 7 以 +44% 校验器成本消除同向双翻转盲区并把随机逃逸压到 14.3%,是预算放宽到 ~15% 时的首选档**。
 - 按"校验器增量局限于乘法器作用域"外推集成占比:mod 3 实测 9.8% FPU → mod 15 ≈ 19% → mod 63 ≈ 30%。**第 7 章的预算判断证实:8–12% FPU 预算内仅 mod 3 可行;mod 63 树面积 ×3 的预测与实测(3.09×)偏差 <3%**;mod 15 以约 2× 校验器成本换 5 倍混叠压缩(33%→6.7%),是预算翻倍情形下的中间选项。
 - K≥4 的报警延迟为输出后 2 拍(c2);1800 ps 下 cmp1 只有 K=2 可行。双模数并行(3∥5,近似 mod-15 覆盖)未实测,留作候选。
+
+### 3.6 阶段 1 核心:加数通路影子(第 5 章链条第二环,2026-07-16)
+
+**范围**:`transdot_decomp_addend_datapath_piped`(经 FMA 实际例化的 `_combined_product_dp` 包装,含乘积摆位),即乘积对齐 + 100 位分段对齐移位器(含 sticky 压缩,**寄存**)+ 双 w4 分段加法器(sum_pos/sum_neg)+ 符号判决——FPU 中仅次于乘法器的数据通路块。影子分四层:**[A]** 移位寄存器分段残差(4×25 位四分树,按模式组合)对照载荷残差旋转——覆盖整个寄存器含 sticky 位(FMA 参数化下打包恰为 4×25,架构 shamt 界内零丢弃;几何越界标志把界外 shamt 排除在层 A 之外);**[B]** 两台加法器按 merge-lane 粒度校验(正路恒查、负路被选中时查;kept 切片残差由分段/sticky/余段提取推导;取反按 lane 窗口"常数减残差"处理,含 FP8 负路掩码的 18 位窗口);**[C]** sticky 标志 OR 复制;**[D]** 符号判决镜像。**报警以"流水推进拍 + 已装载操作"限定**——这正是 FMA 中游流水捕获和数的拍;停顿/气泡拍的配对不具架构意义(该限定把 FMA 级误报从 19,433 → 0,分三步:sticky 切片几何、装载限定、推进拍限定)。
+
+三条工程教训(RTL 头注释与记忆均已记录):**参数陷阱**——按模块默认参数探测的是一个坏配置(切片字面量假定 FMA 的 SUPER_MAN_BITS_FP8=3),先前"截位/越界比特"的发现全为该伪影,几何常量必须按例化参数钉死;**预测链必须端到端规范化**(冗余数字穿过纯旋转链存活,以 ~1/m 概率误报);**Presto ELAB-302**——异步复位 always 块只许单个顶层 if(VCS 容忍双 if,DC 直接放弃编译整个模块,主通路被清空——网表面积异常小是该故障的指纹)。
+
+**验证**:301k 周期随机 TB(`tb/safedot/tb_safedot_addend.sv`,批式模式切换 + FMA 端口时序契约 + 架构 shamt 界)× {K=2 双树形、K=3、K=4、K=5、K=6} 全零误报、8/8 注入(移位寄存器 kept/sticky 位、双加法器、sticky 标志、符号、影子自身);**FMA 回归 21,510/21,510,乘法器 + 加数双影子实弹(K=2 与 K=6),双监视器全程零报警**。
+
+**综合(1800 ps,DC+PT 双收敛)**:
+
+| 设计 | 面积 (µm²) | 增量 | 时序 |
+|---|---|---|---|
+| 加数通路 base(`safedot_addend_core`) | 1059.6 | — | DC +0.7,PT 无违例 |
+| 加数通路 + mod3 影子 | 1658.6 | **+599.0(+56.5%)** | DC +0.6,PT 无违例 |
+
+**FPU 级双影子集成(transdot_fpu_top,2100 ps,DC +1.7,PT 无违例)**:base 5306.5 → 乘法器影子 5826.4(+9.8%)→ **双影子 6399.4 = +1092.9 µm²(+20.6% FPU)**;加数影子集成增量 +573.0 ≈ 块级 +599 ✓。受保护面积域(乘法器 ~1592 + 加数 ~800)≈ FPU 的 45%。加数块相对溢价(+56.5%)高于乘法器(+33.5%)符合第 7 章预判:移位/加法块以布线与加法器为主,而校验成本按数据宽度走(100 位寄存器 + 双 76 位加法器的提取点密度高);输出检查点合并类的回收(3.4 节手法)留作后续。
 
 ## 4 复现命令
 
@@ -144,9 +166,13 @@ TOPS=safedot_stage0_mod3 CLKS=600 STAGES=4 CMP=2 ./run_stage0_syn.sh
 # v4 变体 A/B(VTAG 隔离结果目录;EXTRA_DEFS 注入宏;0.8 ns 收敛配置用传统树)
 TOPS=safedot_stage0_mod3 CLKS=1800 VTAG=v4b ./run_stage0_syn.sh
 TOPS=safedot_stage0_mod3 CLKS=800 STAGES=1 VTAG=v4a EXTRA_DEFS="+SAFEDOT_TREE_LEGACY" ./run_stage0_syn.sh
-# 模数 Pareto(K≥4 需两拍比较)
-TOPS=safedot_stage0_mod3 CLKS=1800 CMP=2 VTAG=k4 EXTRA_DEFS="+SAFEDOT_K=4" ./run_stage0_syn.sh
+# 模数 Pareto(K≥3 需两拍比较;K∈{3,4,5,6} → mod 7/15/31/63)
+TOPS=safedot_stage0_mod3 CLKS=1800 CMP=2 VTAG=k3 EXTRA_DEFS="+SAFEDOT_K=3" ./run_stage0_syn.sh
 TOPS=safedot_stage0_mod3 CLKS=1800 CMP=2 VTAG=k6 EXTRA_DEFS="+SAFEDOT_K=6" ./run_stage0_syn.sh
+# 加数通路 A/B 与 FPU 级双影子
+TOPS=safedot_addend_core CLKS=1800 VTAG=add0 ./run_stage0_syn.sh
+TOPS=safedot_addend_core CLKS=1800 VTAG=addsd EXTRA_DEFS="+SAFEDOT_FMA_CHECK" ./run_stage0_syn.sh
+TOPS=transdot_fpu_top SAFEDOT_FL=safedot_fpu_syn.f CLKS=2100 VTAG=fpusd2 EXTRA_DEFS="$TDEF+SAFEDOT_FMA_CHECK" ./run_stage0_syn.sh
 # FPU 级集成 A/B(transdot_fpu_top,SAFEDOT_FL 换填 FPU 文件列表)
 TDEF="+TRANSDOT_ENABLE+USE_TRANSDOT_MULTIPLIER+USE_TRANSDOT_EXPONENT_DATAPATH+USE_TRANSDOT_ADDEND_DATAPATH+USE_TRANSDOT_NORMALIZE_DATAPATH+FP4_INCLUDED"
 TOPS=transdot_fpu_top SAFEDOT_FL=safedot_fpu_syn.f CLKS=2100 VTAG=fpu0 EXTRA_DEFS="$TDEF" ./run_stage0_syn.sh
