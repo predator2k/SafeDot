@@ -1,4 +1,11 @@
 module transdot_decomp_addend_datapath_piped #(
+`ifdef SAFEDOT_FMA_CHECK
+  // SafeDot: with +define+SAFEDOT_FMA_CHECK the residue shadow is enabled in
+  // every instance without interface changes (mirrors the multiplier).
+  parameter bit          SAFEDOT_CHECK  = 1'b1,
+`else
+  parameter bit          SAFEDOT_CHECK  = 1'b0,
+`endif
   parameter int unsigned SUPER_MAN_BITS     = 23,  // mantissa width of superformat
   parameter int unsigned PRECISION_BITS     = SUPER_MAN_BITS + 1,  // mantissa precision bits (FP32: 24)
   parameter int unsigned SHIFT_AMOUNT_WIDTH = $clog2(3 * PRECISION_BITS + 5),   // shift amount bit width (for FP32: log2(77)=7)
@@ -66,7 +73,12 @@ module transdot_decomp_addend_datapath_piped #(
   // ---------------- SIMD lane 3 Outputs ----------------
   output logic                               sticky_before_add_fp8_2_o,
   output logic [3*PRECISION_BITS_FP8+3:0]        sum_fp8_2_o,
-  output logic                               final_sign_fp8_2_o
+  output logic                               final_sign_fp8_2_o,
+  // SafeDot residue-shadow alarm: [0] shifter-register segment checks,
+  // [1] adder / selected-sum checks, [2] sticky-flag replicas,
+  // [3] final-sign mirrors. Constant 0 when the shadow is disabled; flows
+  // that do not compile src/safedot/* are unaffected.
+  output logic [3:0]                         safedot_alarm_o
 );
 
 // --------------------------------------------------------------------------
@@ -434,6 +446,377 @@ module transdot_decomp_addend_datapath_piped #(
   assign sticky_before_add_fp8_2_o  = sticky_before_add_fp8_2;
   assign sum_fp8_2_o                = sum_fp8_2;
   assign final_sign_fp8_2_o         = final_sign_fp8_2;
+
+  // --------------------------------------------------------------------------
+  // SafeDot residue shadow for the addend datapath (stage-1 core;
+  // docs/SafeDot.md sec. 5.2/5.3). Modulus m = 2^SAFEDOT_K - 1 (mod 3
+  // default). All packing/segment facts below were pinned empirically
+  // against this RTL (one-hot probe + FMA-regression survey) — including
+  // the fp8-mode 102->100 packing clip of mantissa_c[23:22] and the
+  // foreign bits parked in neighbor quarters; the shadow mirrors the RTL
+  // exactly (the bit-exact C++ golden defines these as the architecture).
+  //
+  // Timing contract (as instantiated by the FMA): mantissa/shamt arrive at
+  // cycle T (consumed by the shifter, registered in addend_shift_full);
+  // product_shifted / effective_subtraction / tentative_sign arrive at
+  // T+1 and combine with the registered shift result; outputs are
+  // combinational at T+1. Mode signals must be stable across T/T+1 (the
+  // main datapath itself relies on this). The shadow registers T-side
+  // payload residues and compares everything at T+1; the alarm is
+  // registered (T+2).
+  //
+  // Checks: [0] shifter-register segments vs payload-residue rotations
+  // (covers the 100-bit register including sticky bits — nothing is ever
+  // discarded inside a segment for architectural shamt ranges);
+  // [1] both w4 adders at merge-lane granularity (positive always, negative
+  // when selected), with kept-slice residues derived from segment/sticky/
+  // remainder extractions and complements handled as constant-minus-residue
+  // over each lane's merge window; [2] sticky-flag OR replicas;
+  // [3] final-sign mirrors.
+  // --------------------------------------------------------------------------
+`ifdef SAFEDOT_CHECK_EN
+`ifndef SAFEDOT_K
+`define SAFEDOT_K 2
+`endif
+  generate if (SAFEDOT_CHECK) begin : g_safedot
+    localparam int unsigned SD_K = `SAFEDOT_K;
+    `include "safedot_res.svh"
+    localparam int unsigned MW = $clog2(SD_K > 1 ? SD_K : 2);
+    // Complement windows per merge lane (value = 2^W - 1 - x):
+    // (2^(W mod K) - 1) < m always, so no folding needed.
+    localparam logic [SD_K-1:0] SD_C1     = SD_K'(1);
+    localparam logic [SD_K-1:0] SD_C16M1  = SD_K'((1 << (16 % SD_K)) - 1);
+    localparam logic [SD_K-1:0] SD_C18M1  = SD_K'((1 << (18 % SD_K)) - 1);
+    localparam logic [SD_K-1:0] SD_C38M1  = SD_K'((1 << (38 % SD_K)) - 1);
+    localparam logic [SD_K-1:0] SD_C76M1  = SD_K'((1 << (76 % SD_K)) - 1);
+    localparam logic [SD_K-1:0] SD_C2P76  = SD_K'(1 << (76 % SD_K));
+
+    // ---- launch cycle (T): payload residues + shamt mod K + modes.
+    sd_res_t sd_r_mc24, sd_r_mch, sd_r_mcf8, sd_r_mcs, sd_r_mcsf8;
+    sd_res_t sd_r_mc1, sd_r_mc2;
+    safedot_mod3_reduce #(.W(24), .K(SD_K)) u_sd_mc24 (.x_i(mantissa_c_i),        .r_o(sd_r_mc24));
+    safedot_mod3_reduce #(.W(11), .K(SD_K)) u_sd_mch  (.x_i(mantissa_c_i[23:13]), .r_o(sd_r_mch));
+    safedot_mod3_reduce #(.W(4),  .K(SD_K)) u_sd_mcf8 (.x_i(mantissa_c_i[23:20]), .r_o(sd_r_mcf8));
+    safedot_mod3_reduce #(.W(11), .K(SD_K)) u_sd_mcs  (.x_i(mantissa_c_simd_i),   .r_o(sd_r_mcs));
+    safedot_mod3_reduce #(.W(4),  .K(SD_K)) u_sd_mcsf8(.x_i(mantissa_c_simd_i[10:7]), .r_o(sd_r_mcsf8));
+    safedot_mod3_reduce #(.W(4),  .K(SD_K)) u_sd_mc1  (.x_i(mantissa_c_fp8_1_i[3:0]), .r_o(sd_r_mc1));
+    safedot_mod3_reduce #(.W(4),  .K(SD_K)) u_sd_mc2  (.x_i(mantissa_c_fp8_2_i[3:0]), .r_o(sd_r_mc2));
+
+    sd_res_t sd_r_mc24_q, sd_r_mch_q, sd_r_mcf8_q, sd_r_mcs_q, sd_r_mcsf8_q;
+    sd_res_t sd_r_mc1_q, sd_r_mc2_q;
+    // Alarm is qualified to the first cycle after a register load: that is
+    // the cycle the FMA pairs this op's shifted addend with its product and
+    // subtraction controls (holds and bubbles are not architecturally
+    // consumed and would pair stale values).
+    logic sd_vld_q;
+    // Geometric in-range flags: a shamt beyond the payload's segment-bottom
+    // offset (76/39/21) discards payload bits, which the rotation identity
+    // does not model. Architectural shamts (<= 76/37/16) never exceed them;
+    // out-of-contract shamts leave layer A ungated only where safe.
+    logic sd_shok_sc_q, sd_shok_h_q, sd_shok_l_q;
+    logic sd_shok3_q, sd_shok2_q, sd_shok1_q, sd_shok0_q;
+    logic [MW-1:0] sd_sh_mk_q, sd_shs_mk_q, sd_sh1_mk_q, sd_sh2_mk_q;
+    logic sd_simd_q, sd_fp8_q;
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+      if (!rst_ni) begin
+        sd_r_mc24_q  <= '0;
+        sd_r_mch_q   <= '0;
+        sd_r_mcf8_q  <= '0;
+        sd_r_mcs_q   <= '0;
+        sd_r_mcsf8_q <= '0;
+        sd_r_mc1_q   <= '0;
+        sd_r_mc2_q   <= '0;
+        sd_vld_q     <= 1'b0;
+        sd_shok_sc_q <= 1'b0;
+        sd_shok_h_q  <= 1'b0;
+        sd_shok_l_q  <= 1'b0;
+        sd_shok3_q   <= 1'b0;
+        sd_shok2_q   <= 1'b0;
+        sd_shok1_q   <= 1'b0;
+        sd_shok0_q   <= 1'b0;
+        sd_sh_mk_q   <= '0;
+        sd_shs_mk_q  <= '0;
+        sd_sh1_mk_q  <= '0;
+        sd_sh2_mk_q  <= '0;
+        sd_simd_q    <= 1'b0;
+        sd_fp8_q     <= 1'b0;
+      end else begin
+        sd_vld_q <= pipe_en;
+      end
+      if (rst_ni && pipe_en) begin
+        sd_vld_q     <= 1'b1;
+        sd_r_mc24_q  <= sd_r_mc24;
+        sd_r_mch_q   <= sd_r_mch;
+        sd_r_mcf8_q  <= sd_r_mcf8;
+        sd_r_mcs_q   <= sd_r_mcs;
+        sd_r_mcsf8_q <= sd_r_mcsf8;
+        sd_r_mc1_q   <= sd_r_mc1;
+        sd_r_mc2_q   <= sd_r_mc2;
+        sd_shok_sc_q <= (addend_shamt_i <= 76);
+        sd_shok_h_q  <= (addend_shamt_i <= 39);
+        sd_shok_l_q  <= (addend_shamt_simd_i <= 39);
+        sd_shok3_q   <= (addend_shamt_i <= 21);
+        sd_shok2_q   <= (addend_shamt_fp8_1_i <= 21);
+        sd_shok1_q   <= (addend_shamt_simd_i <= 21);
+        sd_shok0_q   <= (addend_shamt_fp8_2_i <= 21);
+        sd_sh_mk_q   <= MW'(addend_shamt_i % SD_K);
+        sd_shs_mk_q  <= MW'(addend_shamt_simd_i % SD_K);
+        sd_sh1_mk_q  <= MW'(addend_shamt_fp8_1_i % SD_K);
+        sd_sh2_mk_q  <= MW'(addend_shamt_fp8_2_i % SD_K);
+        sd_simd_q    <= simd_enable_i;
+        sd_fp8_q     <= is_fp8;
+      end
+    end
+
+    // ---- compare cycle (T+1), layer A: register segment checks.
+    // Quarter residues of the registered shifter output (canonical: fp8
+    // mode compares them directly).
+    sd_res_t sd_rq0, sd_rq1, sd_rq2, sd_rq3;
+    safedot_mod3_reduce #(.W(25), .K(SD_K)) u_sd_q0 (.x_i(addend_shift_full[24:0]),  .r_o(sd_rq0));
+    safedot_mod3_reduce #(.W(25), .K(SD_K)) u_sd_q1 (.x_i(addend_shift_full[49:25]), .r_o(sd_rq1));
+    safedot_mod3_reduce #(.W(25), .K(SD_K)) u_sd_q2 (.x_i(addend_shift_full[74:50]), .r_o(sd_rq2));
+    safedot_mod3_reduce #(.W(25), .K(SD_K)) u_sd_q3 (.x_i(addend_shift_full[99:75]), .r_o(sd_rq3));
+    sd_res_t sd_segl, sd_segh, sd_seg100;
+    assign sd_segl   = sd_add(sd_rq0, sd_rols(sd_rq1, 25));
+    assign sd_segh   = sd_add(sd_rq2, sd_rols(sd_rq3, 25));
+    assign sd_seg100 = sd_add(sd_segl, sd_rols(sd_segh, 50));
+
+    sd_res_t sd_pred100, sd_predh, sd_predl;
+    sd_res_t sd_predq3, sd_predq2, sd_predq1, sd_predq0;
+    assign sd_pred100 = sd_rord(sd_rols(sd_r_mc24_q, 76), sd_sh_mk_q);
+    assign sd_predh   = sd_rord(sd_rols(sd_r_mch_q, 39), sd_sh_mk_q);
+    assign sd_predl   = sd_rord(sd_rols(sd_r_mcs_q, 39), sd_shs_mk_q);
+    // FP8 quarters (FMA config, PRECISION_BITS_FP8 == 4): each quarter
+    // holds one 4-bit payload at segment-relative [24:21]; architectural
+    // shamt <= 16 keeps every payload bit inside its quarter.
+    assign sd_predq3  = sd_rord(sd_rols(sd_r_mcf8_q, 21), sd_sh_mk_q);
+    assign sd_predq2  = sd_rord(sd_rols(sd_r_mc1_q, 21), sd_sh1_mk_q);
+    assign sd_predq1  = sd_rord(sd_rols(sd_r_mcsf8_q, 21), sd_shs_mk_q);
+    assign sd_predq0  = sd_rord(sd_rols(sd_r_mc2_q, 21), sd_sh2_mk_q);
+
+    logic sd_mis_a;
+    assign sd_mis_a = sd_simd_q
+        ? (sd_fp8_q ? ((sd_shok3_q && (sd_rq3 != sd_predq3)) ||
+                       (sd_shok2_q && (sd_rq2 != sd_predq2)) ||
+                       (sd_shok1_q && (sd_rq1 != sd_predq1)) ||
+                       (sd_shok0_q && (sd_rq0 != sd_predq0)))
+                    : ((sd_shok_h_q && (sd_segh != sd_predh)) ||
+                       (sd_shok_l_q && (sd_segl != sd_predl))))
+        : (sd_shok_sc_q && (sd_seg100 != sd_pred100));
+
+    // ---- layer B prerequisites: sticky/remainder extractions and derived
+    // kept-slice residues (mode-fixed register slices; digits are fine,
+    // sd_sub canonicalizes).
+    sd_res_t sd_stk24, sd_stkh, sd_stkl, sd_remh, sd_reml;
+    sd_res_t sd_stk8 [0:3];
+    sd_res_t sd_rem8 [0:3];
+    safedot_mod3_reduce #(.W(24), .K(SD_K), .CANON(1'b0)) u_sd_stk24 (.x_i(addend_shift_full[23:0]),  .r_o(sd_stk24));
+    safedot_mod3_reduce #(.W(11), .K(SD_K), .CANON(1'b0)) u_sd_stkh  (.x_i(addend_shift_full[62:52]), .r_o(sd_stkh));
+    safedot_mod3_reduce #(.W(11), .K(SD_K), .CANON(1'b0)) u_sd_stkl  (.x_i(addend_shift_full[12:2]),  .r_o(sd_stkl));
+    safedot_mod3_reduce #(.W(2),  .K(SD_K), .CANON(1'b0)) u_sd_remh  (.x_i(addend_shift_full[51:50]), .r_o(sd_remh));
+    safedot_mod3_reduce #(.W(2),  .K(SD_K), .CANON(1'b0)) u_sd_reml  (.x_i(addend_shift_full[1:0]),   .r_o(sd_reml));
+    safedot_mod3_reduce #(.W(4),  .K(SD_K), .CANON(1'b0)) u_sd_stk8_0 (.x_i(addend_shift_full[83:80]), .r_o(sd_stk8[0]));
+    safedot_mod3_reduce #(.W(4),  .K(SD_K), .CANON(1'b0)) u_sd_stk8_1 (.x_i(addend_shift_full[58:55]), .r_o(sd_stk8[1]));
+    safedot_mod3_reduce #(.W(4),  .K(SD_K), .CANON(1'b0)) u_sd_stk8_2 (.x_i(addend_shift_full[33:30]), .r_o(sd_stk8[2]));
+    safedot_mod3_reduce #(.W(4),  .K(SD_K), .CANON(1'b0)) u_sd_stk8_3 (.x_i(addend_shift_full[8:5]),   .r_o(sd_stk8[3]));
+    safedot_mod3_reduce #(.W(5),  .K(SD_K), .CANON(1'b0)) u_sd_rem8_0 (.x_i(addend_shift_full[79:75]), .r_o(sd_rem8[0]));
+    safedot_mod3_reduce #(.W(5),  .K(SD_K), .CANON(1'b0)) u_sd_rem8_1 (.x_i(addend_shift_full[54:50]), .r_o(sd_rem8[1]));
+    safedot_mod3_reduce #(.W(5),  .K(SD_K), .CANON(1'b0)) u_sd_rem8_2 (.x_i(addend_shift_full[29:25]), .r_o(sd_rem8[2]));
+    safedot_mod3_reduce #(.W(5),  .K(SD_K), .CANON(1'b0)) u_sd_rem8_3 (.x_i(addend_shift_full[4:0]),   .r_o(sd_rem8[3]));
+
+    // Kept-slice residues (the values the adders actually consume):
+    //   scalar: seg100 = kept76 * 2^24 + stk24
+    //   fp16:   seg50  = kept37 * 2^13 + stk11 * 2^2 + rem2
+    //   fp8:    seg25  = kept   * 2^(9|10) + stk * 2^5 + rem5
+    sd_res_t sd_kept_sc, sd_kept16h, sd_kept16l;
+    sd_res_t sd_kept8 [0:3];
+    assign sd_kept_sc = sd_rols(sd_sub(sd_seg100, sd_stk24), SD_K - (24 % SD_K));
+    assign sd_kept16h = sd_rols(sd_sub(sd_sub(sd_segh, sd_rols(sd_stkh, 2)), sd_remh),
+                                SD_K - (13 % SD_K));
+    assign sd_kept16l = sd_rols(sd_sub(sd_sub(sd_segl, sd_rols(sd_stkl, 2)), sd_reml),
+                                SD_K - (13 % SD_K));
+    assign sd_kept8[0] = sd_rols(sd_sub(sd_sub(sd_rq3, sd_rols(sd_stk8[0], 5)), sd_rem8[0]),
+                                 SD_K - (9 % SD_K));
+    assign sd_kept8[1] = sd_rols(sd_sub(sd_sub(sd_rq2, sd_rols(sd_stk8[1], 5)), sd_rem8[1]),
+                                 SD_K - (9 % SD_K));
+    assign sd_kept8[2] = sd_rols(sd_sub(sd_sub(sd_rq1, sd_rols(sd_stk8[2], 5)), sd_rem8[2]),
+                                 SD_K - (9 % SD_K));
+    assign sd_kept8[3] = sd_rols(sd_sub(sd_sub(sd_rq0, sd_rols(sd_stk8[3], 5)), sd_rem8[3]),
+                                 SD_K - (9 % SD_K));
+
+    // ---- layer C: sticky-flag OR replicas and final-sign mirrors (live
+    // modes, mirroring the main path's own mode usage).
+    logic sd_st_sc, sd_st_simd, sd_st_1, sd_st_2;
+    assign sd_st_sc   = simd_enable_i ? (is_fp8 ? (|addend_shift_full[83:80])
+                                                : (|addend_shift_full[62:52]))
+                                      : (|addend_shift_full[23:0]);
+    assign sd_st_simd = is_fp8 ? (|addend_shift_full[33:30]) : (|addend_shift_full[12:2]);
+    assign sd_st_1    = |addend_shift_full[58:55];
+    assign sd_st_2    = |addend_shift_full[8:5];
+    logic sd_mis_c;
+    assign sd_mis_c = (sd_st_sc   != sticky_before_add_o)
+                   || (sd_st_simd != sticky_before_add_simd_o)
+                   || (sd_st_1    != sticky_before_add_fp8_1_o)
+                   || (sd_st_2    != sticky_before_add_fp8_2_o);
+
+    logic sd_fs_sc, sd_fs_simd, sd_fs_1, sd_fs_2;
+    assign sd_fs_sc   = effective_subtraction_i ? ((sum_carry == tentative_sign_i) ? 1'b1 : 1'b0)
+                                                : tentative_sign_i;
+    assign sd_fs_simd = effective_subtraction_simd_i ? ((sum_carry_simd == tentative_sign_simd_i) ? 1'b1 : 1'b0)
+                                                     : tentative_sign_simd_i;
+    assign sd_fs_1    = effective_subtraction_fp8_1_i ? ((sum_carry_fp8_1 == tentative_sign_fp8_1_i) ? 1'b1 : 1'b0)
+                                                      : tentative_sign_fp8_1_i;
+    assign sd_fs_2    = effective_subtraction_fp8_2_i ? ((sum_carry_fp8_2 == tentative_sign_fp8_2_i) ? 1'b1 : 1'b0)
+                                                      : tentative_sign_fp8_2_i;
+    logic sd_mis_d;
+    assign sd_mis_d = (sd_fs_sc != final_sign_o) || (sd_fs_simd != final_sign_simd_o)
+                   || (sd_fs_1 != final_sign_fp8_1_o) || (sd_fs_2 != final_sign_fp8_2_o);
+
+    // ---- layer B: both w4 adders at merge-lane granularity.
+    // Quarter residues of the operand and result merge vectors (19-bit
+    // lanes; each lane's carry bit sits inside its own quarter slice, and
+    // the pad bits above it are structurally zero).
+    sd_res_t sd_rp [0:3];
+    sd_res_t sd_rsp [0:3];
+    sd_res_t sd_rsn [0:3];
+    safedot_mod3_reduce #(.W(19), .K(SD_K), .CANON(1'b0)) u_sd_rp0 (.x_i(product_shifted_merge[18:0]),  .r_o(sd_rp[0]));
+    safedot_mod3_reduce #(.W(19), .K(SD_K), .CANON(1'b0)) u_sd_rp1 (.x_i(product_shifted_merge[37:19]), .r_o(sd_rp[1]));
+    safedot_mod3_reduce #(.W(19), .K(SD_K), .CANON(1'b0)) u_sd_rp2 (.x_i(product_shifted_merge[56:38]), .r_o(sd_rp[2]));
+    safedot_mod3_reduce #(.W(19), .K(SD_K), .CANON(1'b0)) u_sd_rp3 (.x_i(product_shifted_merge[75:57]), .r_o(sd_rp[3]));
+    safedot_mod3_reduce #(.W(19), .K(SD_K)) u_sd_sp0 (.x_i(sum_pos_merge[18:0]),  .r_o(sd_rsp[0]));
+    safedot_mod3_reduce #(.W(19), .K(SD_K)) u_sd_sp1 (.x_i(sum_pos_merge[37:19]), .r_o(sd_rsp[1]));
+    safedot_mod3_reduce #(.W(19), .K(SD_K)) u_sd_sp2 (.x_i(sum_pos_merge[56:38]), .r_o(sd_rsp[2]));
+    safedot_mod3_reduce #(.W(19), .K(SD_K)) u_sd_sp3 (.x_i(sum_pos_merge[75:57]), .r_o(sd_rsp[3]));
+    safedot_mod3_reduce #(.W(19), .K(SD_K)) u_sd_sn0 (.x_i(sum_neg_merge[18:0]),  .r_o(sd_rsn[0]));
+    safedot_mod3_reduce #(.W(19), .K(SD_K)) u_sd_sn1 (.x_i(sum_neg_merge[37:19]), .r_o(sd_rsn[1]));
+    safedot_mod3_reduce #(.W(19), .K(SD_K)) u_sd_sn2 (.x_i(sum_neg_merge[56:38]), .r_o(sd_rsn[2]));
+    safedot_mod3_reduce #(.W(19), .K(SD_K)) u_sd_sn3 (.x_i(sum_neg_merge[75:57]), .r_o(sd_rsn[3]));
+
+    // Replica carry-inject terms use the replica sticky flags, so a fault
+    // in the main path's sticky OR shows up here as well.
+    logic sd_cin_sc, sd_cin_simd, sd_cin_1, sd_cin_2;
+    assign sd_cin_sc   = effective_subtraction_i        & ~sd_st_sc;
+    assign sd_cin_simd = effective_subtraction_simd_i   & ~sd_st_simd;
+    assign sd_cin_1    = effective_subtraction_fp8_1_i  & ~sd_st_1;
+    assign sd_cin_2    = effective_subtraction_fp8_2_i  & ~sd_st_2;
+
+    // Scalar mode: one 77-bit lane (carry at bit 76).
+    sd_res_t sd_pos_lhs_sc, sd_pos_rhs_sc, sd_neg_lhs_sc, sd_neg_rhs_sc;
+    sd_res_t sd_rp_all;
+    assign sd_rp_all = sd_add(sd_add(sd_rp[0], sd_rols(sd_rp[1], 19)),
+                              sd_add(sd_rols(sd_rp[2], 38), sd_rols(sd_rp[3], 57)));
+    assign sd_pos_lhs_sc = sd_add(sd_add(sd_add(sd_rsp[0], sd_rols(sd_rsp[1], 19)),
+                                         sd_add(sd_rols(sd_rsp[2], 38), sd_rols(sd_rsp[3], 57))),
+                                  sum_pos_merge[76] ? SD_C2P76 : {SD_K{1'b0}});
+    assign sd_pos_rhs_sc = sd_add(sd_add(sd_rp_all,
+                                         effective_subtraction_i ? sd_sub(SD_C76M1, sd_kept_sc)
+                                                                 : sd_canon(sd_kept_sc)),
+                                  sd_cin_sc ? SD_C1 : {SD_K{1'b0}});
+    assign sd_neg_lhs_sc = sd_add(sd_add(sd_add(sd_rsn[0], sd_rols(sd_rsn[1], 19)),
+                                         sd_add(sd_rols(sd_rsn[2], 38), sd_rols(sd_rsn[3], 57))),
+                                  sum_neg_merge[76] ? SD_C2P76 : {SD_K{1'b0}});
+    assign sd_neg_rhs_sc = sd_add(sd_add(sd_canon(sd_kept_sc), sd_sub(SD_C76M1, sd_rp_all)), SD_C1);
+
+    // FP16 mode: two 38-bit lanes (low = scalar-lane variables, high =
+    // simd-lane variables; carries at merge bits 37 / 75 sit inside the
+    // quarter slices).
+    sd_res_t sd_pos_lhs_l, sd_pos_rhs_l, sd_neg_lhs_l, sd_neg_rhs_l;
+    sd_res_t sd_pos_lhs_h, sd_pos_rhs_h, sd_neg_lhs_h, sd_neg_rhs_h;
+    sd_res_t sd_rp_l, sd_rp_h;
+    assign sd_rp_l = sd_add(sd_rp[0], sd_rols(sd_rp[1], 19));
+    assign sd_rp_h = sd_add(sd_rp[2], sd_rols(sd_rp[3], 19));
+    assign sd_pos_lhs_l = sd_add(sd_rsp[0], sd_rols(sd_rsp[1], 19));
+    assign sd_pos_rhs_l = sd_add(sd_add(sd_rp_l,
+                                        effective_subtraction_i ? sd_sub(SD_C38M1, sd_kept16h)
+                                                                : sd_canon(sd_kept16h)),
+                                 sd_cin_sc ? SD_C1 : {SD_K{1'b0}});
+    assign sd_neg_lhs_l = sd_add(sd_rsn[0], sd_rols(sd_rsn[1], 19));
+    assign sd_neg_rhs_l = sd_add(sd_add(sd_canon(sd_kept16h), sd_sub(SD_C38M1, sd_rp_l)), SD_C1);
+    assign sd_pos_lhs_h = sd_add(sd_rsp[2], sd_rols(sd_rsp[3], 19));
+    assign sd_pos_rhs_h = sd_add(sd_add(sd_rp_h,
+                                        effective_subtraction_simd_i ? sd_sub(SD_C38M1, sd_kept16l)
+                                                                     : sd_canon(sd_kept16l)),
+                                 sd_cin_simd ? SD_C1 : {SD_K{1'b0}});
+    assign sd_neg_lhs_h = sd_add(sd_rsn[2], sd_rols(sd_rsn[3], 19));
+    assign sd_neg_rhs_h = sd_add(sd_add(sd_canon(sd_kept16l), sd_sub(SD_C38M1, sd_rp_h)), SD_C1);
+
+    // FP8 mode: four 17-bit lanes, one per quarter (adder lane order is
+    // q0 = scalar, q1 = fp8_1, q2 = simd, q3 = fp8_2 — NOT the register
+    // quarter order). Complement windows: 16 bits (positive adder operand),
+    // 18 bits (negative adder, after the FP8_NEG_CLEAR_MASK fixup).
+    sd_res_t sd_pos_lhs8 [0:3];
+    sd_res_t sd_pos_rhs8 [0:3];
+    sd_res_t sd_neg_lhs8 [0:3];
+    sd_res_t sd_neg_rhs8 [0:3];
+    // register-side kept indices per adder lane: scalar->kept8[0](q3),
+    // fp8_1->kept8[1](q2), simd->kept8[2](q1), fp8_2->kept8[3](q0).
+    logic sd_es8 [0:3];
+    logic sd_cin8 [0:3];
+    assign sd_es8[0]  = effective_subtraction_i;
+    assign sd_es8[1]  = effective_subtraction_fp8_1_i;
+    assign sd_es8[2]  = effective_subtraction_simd_i;
+    assign sd_es8[3]  = effective_subtraction_fp8_2_i;
+    assign sd_cin8[0] = sd_cin_sc;
+    assign sd_cin8[1] = sd_cin_1;
+    assign sd_cin8[2] = sd_cin_simd;
+    assign sd_cin8[3] = sd_cin_2;
+    for (genvar gl = 0; gl < 4; gl++) begin : g_sd_fp8lane
+      assign sd_pos_lhs8[gl] = sd_canon(sd_rsp[gl]);
+      assign sd_pos_rhs8[gl] = sd_add(sd_add(sd_canon(sd_rp[gl]),
+                                             sd_es8[gl] ? sd_sub(SD_C16M1, sd_kept8[gl])
+                                                        : sd_canon(sd_kept8[gl])),
+                                      sd_cin8[gl] ? SD_C1 : {SD_K{1'b0}});
+      assign sd_neg_lhs8[gl] = sd_canon(sd_rsn[gl]);
+      assign sd_neg_rhs8[gl] = sd_add(sd_add(sd_canon(sd_kept8[gl]),
+                                             sd_sub(SD_C18M1, sd_rp[gl])), SD_C1);
+    end
+
+    // Negative-path checks apply only when that lane's negative sum is the
+    // selected result (mirrors the main path's select condition).
+    logic sd_mis_b;
+    logic sd_negsel_sc, sd_negsel_simd, sd_negsel_1, sd_negsel_2;
+    assign sd_negsel_sc   = effective_subtraction_i       && ~sum_carry;
+    assign sd_negsel_simd = effective_subtraction_simd_i  && ~sum_carry_simd;
+    assign sd_negsel_1    = effective_subtraction_fp8_1_i && ~sum_carry_fp8_1;
+    assign sd_negsel_2    = effective_subtraction_fp8_2_i && ~sum_carry_fp8_2;
+    always_comb begin
+      if (simd_enable_i && is_fp8) begin
+        sd_mis_b = (sd_pos_lhs8[0] != sd_pos_rhs8[0]) || (sd_pos_lhs8[1] != sd_pos_rhs8[1])
+                || (sd_pos_lhs8[2] != sd_pos_rhs8[2]) || (sd_pos_lhs8[3] != sd_pos_rhs8[3])
+                || (sd_negsel_sc   && (sd_neg_lhs8[0] != sd_neg_rhs8[0]))
+                || (sd_negsel_1    && (sd_neg_lhs8[1] != sd_neg_rhs8[1]))
+                || (sd_negsel_simd && (sd_neg_lhs8[2] != sd_neg_rhs8[2]))
+                || (sd_negsel_2    && (sd_neg_lhs8[3] != sd_neg_rhs8[3]));
+      end else if (simd_enable_i) begin
+        sd_mis_b = (sd_pos_lhs_l != sd_pos_rhs_l) || (sd_pos_lhs_h != sd_pos_rhs_h)
+                || (sd_negsel_sc   && (sd_neg_lhs_l != sd_neg_rhs_l))
+                || (sd_negsel_simd && (sd_neg_lhs_h != sd_neg_rhs_h));
+      end else begin
+        sd_mis_b = (sd_pos_lhs_sc != sd_pos_rhs_sc)
+                || (sd_negsel_sc && (sd_neg_lhs_sc != sd_neg_rhs_sc));
+      end
+    end
+
+    // ---- alarm register (T+2).
+    // The compare is architecturally settled in cycles where the pipeline
+    // advances (pipe_en): that is when the downstream stage captures this
+    // module's outputs, and the FMA guarantees the cycle-2 inputs (product,
+    // subtraction controls) belong to the op whose shifted addend is in the
+    // register. sd_vld_q additionally requires that the register holds a
+    // launched op (kills reset/bubble garbage).
+    logic [3:0] sd_alarm_q;
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+      if (!rst_ni) sd_alarm_q <= '0;
+      else         sd_alarm_q <= {4{sd_vld_q && pipe_en}}
+                              & {sd_mis_d, sd_mis_c, sd_mis_b, sd_mis_a};
+    end
+    assign safedot_alarm_o = sd_alarm_q;
+  end else begin : g_safedot_off
+    assign safedot_alarm_o = '0;
+  end endgenerate
+`else
+  assign safedot_alarm_o = '0;
+`endif
 endmodule
 
 
@@ -552,7 +935,8 @@ module transdot_decomp_addend_datapath_piped_packed_product #(
     .tentative_sign_fp8_2_i        ( tentative_sign_fp8_2_i ),
     .sticky_before_add_fp8_2_o     ( sticky_before_add_fp8_2_o ),
     .sum_fp8_2_o                   ( sum_fp8_2_o ),
-    .final_sign_fp8_2_o            ( final_sign_fp8_2_o )
+    .final_sign_fp8_2_o            ( final_sign_fp8_2_o ),
+    .safedot_alarm_o               ( /* unused in this variant */ )
   );
 endmodule
 
@@ -698,7 +1082,8 @@ module transdot_decomp_addend_datapath_piped_packed_product_dp #(
     .tentative_sign_fp8_2_i        ( tentative_sign_fp8_2_i ),
     .sticky_before_add_fp8_2_o     ( sticky_before_add_fp8_2_o ),
     .sum_fp8_2_o                   ( sum_fp8_2_o ),
-    .final_sign_fp8_2_o            ( final_sign_fp8_2_o )
+    .final_sign_fp8_2_o            ( final_sign_fp8_2_o ),
+    .safedot_alarm_o               ( /* unused in this variant */ )
   );
 endmodule
 
@@ -760,7 +1145,9 @@ module transdot_decomp_addend_datapath_piped_combined_product_dp #(
   input  logic                               tentative_sign_fp8_2_i,
   output logic                               sticky_before_add_fp8_2_o,
   output logic [3*PRECISION_BITS_FP8+3:0]    sum_fp8_2_o,
-  output logic                               final_sign_fp8_2_o
+  output logic                               final_sign_fp8_2_o,
+  // SafeDot shadow alarm pass-through (constant 0 when disabled).
+  output logic [3:0]                         safedot_alarm_o
 );
 
   logic [3*PRECISION_BITS+3:0]      product_shifted_selected;
@@ -852,6 +1239,7 @@ module transdot_decomp_addend_datapath_piped_combined_product_dp #(
     .tentative_sign_fp8_2_i        ( tentative_sign_fp8_2_i ),
     .sticky_before_add_fp8_2_o     ( sticky_before_add_fp8_2_o ),
     .sum_fp8_2_o                   ( sum_fp8_2_o ),
-    .final_sign_fp8_2_o            ( final_sign_fp8_2_o )
+    .final_sign_fp8_2_o            ( final_sign_fp8_2_o ),
+    .safedot_alarm_o               ( safedot_alarm_o )
   );
 endmodule

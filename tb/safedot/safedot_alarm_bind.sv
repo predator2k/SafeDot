@@ -45,3 +45,12 @@ bind transdot_decomp_multiplier_w6_4lane_dp_piped safedot_alarm_monitor
     .rst_ni (rst_ni),
     .alarm  (safedot_alarm_o)
   );
+
+// Stage-1: same monitor on the addend-datapath shadow (its alarm output is
+// unconnected inside the FMA, so the bind is the observation point).
+bind transdot_decomp_addend_datapath_piped safedot_alarm_monitor
+  u_safedot_addend_alarm_mon (
+    .clk_i  (clk_i),
+    .rst_ni (rst_ni),
+    .alarm  (safedot_alarm_o)
+  );
