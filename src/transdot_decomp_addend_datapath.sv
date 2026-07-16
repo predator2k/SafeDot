@@ -541,11 +541,10 @@ module transdot_decomp_addend_datapath_piped #(
         sd_simd_q    <= 1'b0;
         sd_fp8_q     <= 1'b0;
       end else begin
+        // single top-level if per Presto async-reset FF policy (ELAB-302)
         sd_vld_q <= pipe_en;
-      end
-      if (rst_ni && pipe_en) begin
-        sd_vld_q     <= 1'b1;
-        sd_r_mc24_q  <= sd_r_mc24;
+        if (pipe_en) begin
+          sd_r_mc24_q  <= sd_r_mc24;
         sd_r_mch_q   <= sd_r_mch;
         sd_r_mcf8_q  <= sd_r_mcf8;
         sd_r_mcs_q   <= sd_r_mcs;
@@ -565,6 +564,7 @@ module transdot_decomp_addend_datapath_piped #(
         sd_sh2_mk_q  <= MW'(addend_shamt_fp8_2_i % SD_K);
         sd_simd_q    <= simd_enable_i;
         sd_fp8_q     <= is_fp8;
+        end
       end
     end
 
